@@ -1,6 +1,7 @@
 #include "NeuronCachingAllocator.h"
 
 #include <ATen/core/TensorBody.h>
+#include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/DeviceType.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
 #include <c10/core/TensorImpl.h>
@@ -215,9 +216,68 @@ void neuron_deleter(void* ctx) {
   }
 }
 
-class NeuronAllocator : public c10::Allocator {
+// Copy one byte statistic into PyTorch's StatArray. The allocator keeps a
+// single pool, so the per-pool entries stay zero and only AGGREGATE is set.
+void fillStat(c10::CachingDeviceAllocator::StatArray& out,
+              const at::neuron::metrics::MemoryStatInfo& in) {
+  auto& agg = out[static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE)];
+  agg.current = in.current;
+  agg.peak = in.peak;
+  agg.allocated = in.allocated;
+  agg.freed = in.freed;
+}
+
+// Registered as the PrivateUse1 allocator. Deriving from c10::DeviceAllocator
+// makes the device-generic torch.accelerator memory APIs (empty_cache,
+// memory_stats, reset_peak_memory_stats, get_memory_info, ...) reach this
+// allocator through c10::getDeviceAllocator.
+class NeuronAllocator : public c10::DeviceAllocator {
  public:
   NeuronAllocator() = default;
+
+  bool initialized() override { return c10_neuron::is_initialized(); }
+
+  void emptyCache(c10::MempoolId_t mempool_id) override {
+    const c10::MempoolId_t default_pool{0, 0};
+    TORCH_CHECK(mempool_id == default_pool,
+                "Neuron caching allocator has no private memory pools; emptyCache only accepts "
+                "the default pool id (0, 0).");
+    NeuronCachingAllocator::emptyCache();
+  }
+
+  void recordStream(const c10::DataPtr& ptr, c10::Stream stream) override {
+    NeuronCachingAllocator::recordStream(ptr, stream);
+  }
+
+  c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex device) override {
+    auto info = at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetMemoryStats(device);
+    c10::CachingDeviceAllocator::DeviceStats stats;
+    fillStat(stats.allocated_bytes, info.allocated_bytes);
+    fillStat(stats.reserved_bytes, info.reserved_bytes);
+    fillStat(stats.active_bytes, info.active_bytes);
+    stats.num_alloc_retries = info.num_alloc_retries;
+    stats.num_ooms = info.num_ooms;
+    return stats;
+  }
+
+  void resetAccumulatedStats(c10::DeviceIndex device) override {
+    at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().ResetAccumulatedStats(device);
+  }
+
+  void resetPeakStats(c10::DeviceIndex device) override {
+    at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().ResetPeakStats(device);
+  }
+
+  // (free, total) bytes of the device's HBM as the runtime reports them for
+  // this logical core, across all processes.
+  std::pair<size_t, size_t> getMemoryInfo(c10::DeviceIndex device) override {
+    torch_neuronx::maybe_lazy_init();
+    uint64_t limit = 0;
+    uint64_t used = 0;
+    TORCH_CHECK(c10_neuron::get_vnc_memory_stats(device, &limit, &used),
+                "nrt_get_vnc_memory_stats failed for Neuron device ", static_cast<int>(device));
+    return {static_cast<size_t>(limit > used ? limit - used : 0), static_cast<size_t>(limit)};
+  }
 
   c10::DataPtr allocate(size_t size) override {
     torch_neuronx::maybe_lazy_init();
