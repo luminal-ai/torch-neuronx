@@ -46,10 +46,11 @@ enum class KernelTypeEnum {
   kAlloc,
   kDealloc,
   kHost,
+  kExternalModel,
 };
 
 // Check if a kernel type represents a device operation (vs host-side operation).
-// Device operations: kHLO, kCollective, kCopy, kCast, kWrite, kRead
+// Device operations: kHLO, kCollective, kCopy, kCast, kWrite, kRead, kExternalModel
 // Host-side operations: kEvent, kBarrier, kAlloc, kDealloc, kHost
 inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
@@ -59,6 +60,7 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
+    case KernelTypeEnum::kExternalModel:
       return true;
     case KernelTypeEnum::kEvent:
     case KernelTypeEnum::kBarrier:
@@ -86,6 +88,7 @@ inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kEvent:
     case KernelTypeEnum::kBarrier:
     case KernelTypeEnum::kHost:
+    case KernelTypeEnum::kExternalModel:
       return false;
   }
   return false;
@@ -95,6 +98,7 @@ inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
 inline size_t GetXUIndex(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
+    case KernelTypeEnum::kExternalModel:
       return NRTA_XU_COMPUTE;
     case KernelTypeEnum::kCollective:
       return NRTA_XU_COLLECTIVES;
@@ -909,6 +913,57 @@ class HostKernelExecution final
  private:
   HostFn fn_;
   std::vector<at::Tensor> keepalives_;
+};
+
+// Execution of a model the caller loaded itself (nrt_load in this process, on
+// this stream's logical core), scheduled on the stream like any compiled graph:
+// nrta_execute_schedule on the COMPUTE XU at the point the stream reaches it.
+// The stream's usual gates order it after earlier work (H2D writes, copies,
+// compute) and order later work (reads, writes, copies, host ops) after it.
+//
+// Each input/output binds an NRT tensor name either to a Neuron torch tensor
+// (resolved, and sliced for views, when the op is scheduled, so lazily bound
+// allocations work) or to a raw nrt_tensor_t* the caller owns. The caller keeps
+// the model and every raw tensor alive until the op completes.
+class ExternalModelKernelExecution final
+    : public NeuronKernelExecutionTyped<KernelTypeEnum::kExternalModel,
+                                        c10::DeviceType::PrivateUse1,
+                                        c10::DeviceType::PrivateUse1> {
+ public:
+  // One tensor-set entry: `tensor_index` >= 0 selects the torch tensor at that
+  // position of the src (inputs) or dst (outputs) refs; otherwise `raw` is used.
+  struct Binding {
+    std::string name;
+    int64_t tensor_index;
+    nrt_tensor_t* raw;
+  };
+
+  ExternalModelKernelExecution(const std::string& op_name, nrt_model_t* model,
+                               std::vector<TensorDataRef>&& input_refs,
+                               std::vector<TensorDataRef>&& output_refs,
+                               const std::vector<TensorContext>& input_contexts,
+                               const std::vector<TensorContext>& output_contexts,
+                               std::vector<Binding> input_bindings,
+                               std::vector<Binding> output_bindings, int device_id)
+      : NeuronKernelExecutionTyped(op_name, std::move(input_refs), std::move(output_refs),
+                                   input_contexts, output_contexts, device_id),
+        model_(model),
+        input_bindings_(std::move(input_bindings)),
+        output_bindings_(std::move(output_bindings)) {}
+
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
+
+  KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kExternalModel; }
+  bool RequiresCompilation() const override { return false; }
+
+ protected:
+  bool ValidateImpl() const override { return model_ != nullptr && !output_bindings_.empty(); }
+
+ private:
+  nrt_model_t* model_;
+  std::vector<Binding> input_bindings_;
+  std::vector<Binding> output_bindings_;
 };
 
 }  // namespace at::neuron

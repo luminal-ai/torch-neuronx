@@ -161,6 +161,7 @@ DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kAlloc, AllocDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kDealloc, DeallocDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kHost, HostKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kExternalModel, ExternalModelKernelExecution)
 
 #undef DEFINE_KERNEL_TYPE_TRAITS
 

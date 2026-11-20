@@ -1,4 +1,5 @@
-from typing import Optional
+from collections.abc import Mapping
+from typing import Optional, Union
 
 import torch
 
@@ -188,3 +189,50 @@ class Event(_NeuronEventBase):
     def synchronize(self) -> None:
         """Wait for all work captured by this event to complete."""
         super().synchronize()
+
+
+def execute_nrt_model(
+    model: int,
+    inputs: Mapping[str, Union[torch.Tensor, int]],
+    outputs: Mapping[str, Union[torch.Tensor, int]],
+    stream: Optional[Stream] = None,
+    name: str = "nrt_model",
+) -> None:
+    """Enqueue one execution of an externally loaded NRT model on a Neuron stream.
+
+    The model was loaded by the caller with ``nrt_load`` in this process, on the logical
+    core of the stream's device. The call returns immediately; the execution runs when the
+    stream reaches it, like any other op on the stream: after the work submitted to the stream
+    before it (including host-to-device writes of its inputs), and before the work submitted
+    after it (compute, copies, device-to-host reads, and writes that overwrite its inputs).
+    Use events and ``Stream.wait_stream`` to order it against other streams, and
+    ``Stream.synchronize`` or an ``Event`` to wait for it on the host.
+
+    Args:
+        model (int): The ``nrt_model_t*`` handle, as an integer.
+        inputs (Mapping[str, Tensor or int]): The model's input tensor names, each bound to a
+            contiguous Neuron tensor on the stream's device or to an ``nrt_tensor_t*`` (int)
+            the caller owns.
+        outputs (Mapping[str, Tensor or int]): The model's output tensor names, bound the same
+            way.
+        stream (Stream, optional): Stream to enqueue on. Defaults to the current stream.
+        name (str, optional): Op name shown in profiles and errors.
+
+    Note:
+        The model and every ``nrt_tensor_t*`` passed must stay valid until the execution
+        completes (for example, until an ``Event`` recorded after it is complete). Torch
+        tensors are kept alive by the stream like the operands of any other op. Execution
+        errors surface the same way as for torch-neuronx's own ops.
+    """
+    if stream is None:
+        import torch_neuronx
+
+        stream = torch_neuronx.current_stream()
+    _C._execute_nrt_model(
+        model,
+        list(inputs.items()),
+        list(outputs.items()),
+        stream.stream_id,
+        stream.device_index,
+        name,
+    )

@@ -1142,6 +1142,7 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCast));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kWrite));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kRead));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kExternalModel));
 }
 
 TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
@@ -1157,6 +1158,28 @@ TEST_F(KernelExecutionTest, GetXUIndexMapping) {
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCast), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kWrite), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kRead), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kExternalModel), NRTA_XU_COMPUTE);
+}
+
+TEST_F(KernelExecutionTest, ExternalModelIsAConcatenationBoundary) {
+  EXPECT_FALSE(IsConcatBufferableKernelType(KernelTypeEnum::kExternalModel));
+}
+
+TEST_F(KernelExecutionTest, ExternalModelKernelValidity) {
+  using Binding = ExternalModelKernelExecution::Binding;
+  auto* fake_model = reinterpret_cast<nrt_model_t*>(0x1000);
+  auto* fake_tensor = reinterpret_cast<nrt_tensor_t*>(0x2000);
+  ExternalModelKernelExecution with_outputs("ext", fake_model, {}, {}, {}, {}, {},
+                                            {Binding{"output0", -1, fake_tensor}}, 0);
+  EXPECT_TRUE(with_outputs.IsValid());
+  EXPECT_EQ(with_outputs.GetKernelType(), KernelTypeEnum::kExternalModel);
+  EXPECT_FALSE(with_outputs.RequiresCompilation());
+
+  ExternalModelKernelExecution no_model("ext", nullptr, {}, {}, {}, {}, {},
+                                        {Binding{"output0", -1, fake_tensor}}, 0);
+  EXPECT_FALSE(no_model.IsValid());
+  ExternalModelKernelExecution no_outputs("ext", fake_model, {}, {}, {}, {}, {}, {}, 0);
+  EXPECT_FALSE(no_outputs.IsValid());
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexThrowsForNonDevice) {

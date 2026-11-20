@@ -315,6 +315,46 @@ bool NeffDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
   return true;
 }
 
+// ExternalModelKernelExecution implementation
+
+bool ExternalModelKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                                            c10::StreamId stream_id) const {
+  // Resolve torch tensors now: their physical binding happens on this worker.
+  const auto src_data_ptrs = HandleContiguousSlicing(GetSrcDataPtrs(), src_tensor_ctxs_);
+  const auto dst_data_ptrs = HandleContiguousSlicing(GetDstDataPtrs(), dst_tensor_ctxs_);
+
+  auto fill = [](const std::vector<Binding>& bindings, const std::vector<nrt_tensor_t*>& tensors,
+                 nrt::TensorSetPtr& set, const char* kind) {
+    for (const auto& binding : bindings) {
+      nrt_tensor_t* tensor = binding.raw;
+      if (binding.tensor_index >= 0) {
+        EXECUTION_RUNTIME_CHECK(static_cast<size_t>(binding.tensor_index) < tensors.size(),
+                                "external model ", kind, " '", binding.name,
+                                "' refers to a missing tensor");
+        tensor = tensors[binding.tensor_index];
+      }
+      EXECUTION_RUNTIME_CHECK(tensor != nullptr, "external model ", kind, " '", binding.name,
+                              "' has no NRT tensor");
+      NRT_STATUS status = nrt::AddTensorToSet(set, binding.name, tensor);
+      EXECUTION_RUNTIME_CHECK_STATUS(status == NRT_SUCCESS, status, "external model ", kind, " '",
+                                     binding.name, "' could not be added to the tensor set");
+    }
+  };
+  auto input_set = nrt::CreateTensorSet();
+  auto output_set = nrt::CreateTensorSet();
+  fill(input_bindings_, src_data_ptrs, input_set, "input");
+  fill(output_bindings_, dst_data_ptrs, output_set, "output");
+
+  int queue = nrt::GetHardwareQueue(NRTA_XU_COMPUTE, stream_id);
+  NRT_STATUS status = nrt::DispatchExecution(model_, input_set.get(), output_set.get(), queue,
+                                             nrt_status, sequence_id);
+  if (status != NRT_SUCCESS) {
+    throw torch_neuronx::ExecutionRuntimeException(
+        "Scheduling external model execution '" + GetOpName() + "' failed", status);
+  }
+  return true;
+}
+
 // CollectiveDirectKernelExecution implementation
 
 CollectiveDirectKernelExecution::CollectiveDirectKernelExecution(

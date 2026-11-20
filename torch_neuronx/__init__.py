@@ -259,7 +259,7 @@ from .profiling import (
 )
 
 # Import stream and event classes
-from .streams import Event, Stream
+from .streams import Event, Stream, execute_nrt_model
 
 # Register neuron as a custom backend (Python side of the PrivateUse1 surface).
 # Skip if another backend already owns PrivateUse1 (imported first) — re-registering

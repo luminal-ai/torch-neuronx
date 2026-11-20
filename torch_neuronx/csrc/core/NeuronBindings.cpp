@@ -2069,6 +2069,63 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("base_cache_key"), py::arg("mlir_bytes"), py::arg("has_collectives"),
       py::arg("additional_args"), py::arg("optimization_level"));
 
+  // Schedule an externally loaded NRT model on a Neuron stream. `inputs` and
+  // `outputs` are sequences of (nrt tensor name, value) where value is a Neuron
+  // torch tensor or an int nrt_tensor_t* the caller owns. Returns immediately.
+  m.def(
+      "_execute_nrt_model",
+      [](uintptr_t model, const py::sequence& inputs, const py::sequence& outputs,
+         int64_t stream_id, int64_t device_index, const std::string& name) {
+        TORCH_CHECK(model != 0, "_execute_nrt_model: null model handle");
+        using Binding = at::neuron::ExternalModelKernelExecution::Binding;
+        auto parse = [device_index](const py::sequence& entries, std::vector<torch::Tensor>& tensors,
+                                    std::vector<Binding>& bindings, const char* kind) {
+          for (const auto& item : entries) {
+            auto entry = item.cast<py::sequence>();
+            TORCH_CHECK(entry.size() == 2, "_execute_nrt_model: each ", kind,
+                        " must be a (name, tensor or nrt_tensor_t*) pair");
+            Binding binding{entry[0].cast<std::string>(), -1, nullptr};
+            py::object value = entry[1];
+            if (THPVariable_Check(value.ptr())) {
+              const auto& tensor = THPVariable_Unpack(value.ptr());
+              TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1 &&
+                              tensor.device().index() == device_index,
+                          "_execute_nrt_model: ", kind, " '", binding.name, "' is on ",
+                          tensor.device(), ", expected neuron:", device_index);
+              binding.tensor_index = static_cast<int64_t>(tensors.size());
+              tensors.push_back(tensor);
+            } else {
+              auto raw = value.cast<uintptr_t>();
+              TORCH_CHECK(raw != 0, "_execute_nrt_model: ", kind, " '", binding.name,
+                          "' is a null nrt_tensor_t*");
+              binding.raw = reinterpret_cast<nrt_tensor_t*>(raw);
+            }
+            bindings.push_back(std::move(binding));
+          }
+        };
+        std::vector<torch::Tensor> input_tensors, output_tensors;
+        std::vector<Binding> input_bindings, output_bindings;
+        parse(inputs, input_tensors, input_bindings, "input");
+        parse(outputs, output_tensors, output_bindings, "output");
+        TORCH_CHECK(!output_bindings.empty(), "_execute_nrt_model: the model needs outputs");
+
+        // Each tensor binds exactly its own bytes (a slice for a view); it must be contiguous.
+        auto [input_refs, input_contexts] = torch_neuronx::PrepareKernelTensors(input_tensors);
+        auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(output_tensors);
+        auto kernel = std::make_unique<at::neuron::ExternalModelKernelExecution>(
+            name, reinterpret_cast<nrt_model_t*>(model), std::move(input_refs),
+            std::move(output_refs), input_contexts, output_contexts, std::move(input_bindings),
+            std::move(output_bindings), static_cast<int>(device_index));
+        at::neuron::NeuronStream stream(static_cast<c10::StreamId>(stream_id),
+                                        static_cast<c10::DeviceIndex>(device_index),
+                                        at::neuron::NeuronStream::UNCHECKED);
+        auto context = std::make_unique<at::neuron::OperationContext>(std::move(kernel), "");
+        at::neuron::SubmitOperationContext(stream, std::move(context));
+      },
+      "Schedule an externally loaded NRT model on a Neuron stream",
+      py::arg("model"), py::arg("inputs"), py::arg("outputs"), py::arg("stream_id"),
+      py::arg("device_index"), py::arg("name"));
+
   // torch.compile: execute compiled graph using cache key
   m.def(
       "execute_compiled_graph",
