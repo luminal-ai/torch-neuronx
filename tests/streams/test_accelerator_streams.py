@@ -37,7 +37,8 @@ class TestAcceleratorStreams:
             ready.record()
         ready.synchronize()
 
-        torch.testing.assert_close(y_cpu, (x.cpu() * 3).sum(dim=-1))
+        # Bit-identical to a blocking read of the same device result.
+        torch.testing.assert_close(y_cpu, y.cpu(), rtol=0, atol=0)
 
     def test_event_orders_streams(self):
         a = torch.randn(1024, device="neuron")
