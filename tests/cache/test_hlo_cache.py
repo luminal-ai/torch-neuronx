@@ -152,3 +152,22 @@ class TestStorageKeyFoldsPlatform:
 
     def test_same_environment_is_stable(self, monkeypatch):
         assert self._hash(monkeypatch, "k") == self._hash(monkeypatch, "k")
+
+
+class TestHloCacheDir:
+    def test_explicit_dir_wins(self, monkeypatch):
+        monkeypatch.setenv("TORCH_NEURONX_HLO_CACHE_DIR", "/x/hlo")
+        monkeypatch.setenv("TORCH_NEURONX_NEFF_CACHE_DIR", "/y/neff")
+        assert _hlo_cache_mod._resolve_cache_dir() == "/x/hlo"
+
+    def test_follows_neff_cache_dir(self, monkeypatch):
+        monkeypatch.delenv("TORCH_NEURONX_HLO_CACHE_DIR", raising=False)
+        monkeypatch.setenv("TORCH_NEURONX_NEFF_CACHE_DIR", "/y/neff")
+        assert _hlo_cache_mod._resolve_cache_dir() == "/y/neff/hlo"
+        # Exported so the C++ cache bindings use the same directory.
+        assert os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] == "/y/neff/hlo"
+
+    def test_default_dir(self, monkeypatch):
+        monkeypatch.delenv("TORCH_NEURONX_HLO_CACHE_DIR", raising=False)
+        monkeypatch.delenv("TORCH_NEURONX_NEFF_CACHE_DIR", raising=False)
+        assert _hlo_cache_mod._resolve_cache_dir() == "/tmp/hlo_cache"

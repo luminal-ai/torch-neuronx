@@ -14,7 +14,8 @@ The mode selects the gate and which manifest fields are written; storage and spe
 serialization are identical. Both modes share one blob layout:
   {key}_v{schema}_hlo / {key}_v{schema}_meta   payload bytes + JSON manifest
 
-Cache dir: TORCH_NEURONX_HLO_CACHE_DIR (default: /tmp/hlo_cache).
+Cache dir: TORCH_NEURONX_HLO_CACHE_DIR (default: <TORCH_NEURONX_NEFF_CACHE_DIR>/hlo when that
+is set, else /tmp/hlo_cache).
 Both modes are also disabled by TORCH_NEURONX_NEFF_DISABLE_CACHE.
 """
 
@@ -35,7 +36,29 @@ _enabled = os.environ.get("TORCH_NEURONX_HLO_CACHE", "1") == "1"
 _compile_enabled = os.environ.get("TORCH_NEURONX_HLO_COMPILE_CACHE", "0") == "1"
 _SCHEMA_VERSION = 1
 _FX_KEY_VERSION = 1
-CACHE_DIR = os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache")
+
+
+def _resolve_cache_dir() -> str:
+    """Directory of the persistent HLO cache.
+
+    ``TORCH_NEURONX_HLO_CACHE_DIR`` when set. Otherwise, when the NEFF cache is placed
+    explicitly (``TORCH_NEURONX_NEFF_CACHE_DIR``), the lowering cache lives with it in
+    ``<neff cache>/hlo``, so the one setting that makes compiled NEFFs persistent also keeps
+    the lowerings a warm NEFF lookup needs (a NEFF hit still requires the op's HLO, see
+    ``TORCH_NEURONX_NEFF_KEY_FROM_HLO``). Else ``/tmp/hlo_cache``.
+
+    The resolved directory is exported as ``TORCH_NEURONX_HLO_CACHE_DIR`` so the C++
+    cache bindings read the same directory.
+    """
+    cache_dir = os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR")
+    if not cache_dir:
+        neff_dir = os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR")
+        cache_dir = os.path.join(neff_dir, "hlo") if neff_dir else "/tmp/hlo_cache"
+        os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] = cache_dir
+    return cache_dir
+
+
+CACHE_DIR = _resolve_cache_dir()
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 

@@ -61,7 +61,7 @@ Compiled NEFFs and lowered HLO entries are cached on disk to avoid recompilation
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `TORCH_NEURONX_NEFF_CACHE_DIR` | path | `/tmp/neff_cache` | Directory for persistent NEFF cache. Point at a shared mount (e.g. FSx) to reuse compiled NEFFs across runs and instances. |
-| `TORCH_NEURONX_HLO_CACHE_DIR` | path | `/tmp/hlo_cache` | Directory for persistent HLO cache, shared by the eager and `torch.compile` entry points. |
+| `TORCH_NEURONX_HLO_CACHE_DIR` | path | `<TORCH_NEURONX_NEFF_CACHE_DIR>/hlo` if that is set, else `/tmp/hlo_cache` | Directory for persistent HLO cache, shared by the eager and `torch.compile` entry points. A persistent NEFF hit needs the op's HLO, so keep both caches on the same persistent storage. |
 | `TORCH_NEURONX_HLO_CACHE` | bool | `True` | When `1`, eager ops cache their HLO lowering to disk, keyed by the dispatch key. |
 | `TORCH_NEURONX_HLO_COMPILE_CACHE` | bool | `False` | (Experimental) When `1`, `torch_neuronx` caches the StableHLO lowering on disk, keyed by the FX graph, so a repeated graph skips FX to StableHLO. This covers only the `torch_neuronx.compiler` API (`fx_to_neff`). Full `torch.compile(backend="neuron")` is not supported, and that path bypasses the cache. The key omits a custom kernel's source, so keep the cache off while you edit kernel code. Also gated by `TORCH_NEURONX_NEFF_DISABLE_CACHE`. |
 | `TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR` | path | `/tmp/local_cache` | Local directory for filelocks and scratch. **Must stay on a local POSIX filesystem** (NFS/Lustre lock semantics are unreliable). |
