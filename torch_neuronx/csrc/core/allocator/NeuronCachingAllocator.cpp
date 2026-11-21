@@ -407,6 +407,18 @@ nrt_tensor_t* getTensorFromContext(void* ctx) {
   return info->block->nrt_slice;
 }
 
+nrt_tensor_t* getBoundTensorFromContext(void* ctx) {
+  TORCH_CHECK(ctx != nullptr, "NeuronAllocator: Context is nullptr");
+  auto* info = static_cast<AllocationInfo*>(ctx);
+  const bool bound = info->is_scalar ? info->scalar_slice != nullptr
+                                     : (info->block != nullptr && info->block->nrt_slice != nullptr);
+  if (!bound) {
+    at::neuron::NeuronStream stream = info->allocation_stream;
+    stream.synchronize();
+  }
+  return getTensorFromContext(ctx);
+}
+
 void recordStream(const c10::DataPtr& data_ptr, c10::Stream stream) {
   void* ptr = data_ptr.get();
   if (!ptr) {

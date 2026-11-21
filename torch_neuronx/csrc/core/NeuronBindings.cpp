@@ -945,10 +945,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1,
                     "Expected Neuron tensor, got ", tensor.device());
 
-        // Get the storage implementation
-        auto storage_impl = tensor.storage().unsafeGetStorageImpl();
-        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
-        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
+        // A fresh allocation is bound to its NRT tensor by its kAlloc op on the
+        // allocation stream; wait for that op (only) when it has not run yet, so
+        // the handle is valid as soon as the tensor exists.
+        const c10::StorageImpl& storage_impl = *tensor.storage().unsafeGetStorageImpl();
+        void* ctx = storage_impl.data_ptr().get_context();
+        nrt_tensor_t* nrt_tensor = nullptr;
+        {
+          py::gil_scoped_release no_gil;
+          nrt_tensor = c10_neuron::NeuronCachingAllocator::getBoundTensorFromContext(ctx);
+        }
 
         // Check for null pointer before creating PyCapsule
         TORCH_CHECK(nrt_tensor != nullptr,

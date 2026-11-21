@@ -29,19 +29,41 @@ def _dense_flat(x):
     return x.view(-1)
 
 
-def _check_values(flat, value):
-    """Every element of the 1-D device tensor `flat` equals `value` (device min/max)."""
-    n = flat.numel()
-    rows, tail = divmod(n, CHECK_ROW)
+def _element_bytes(value, dtype):
+    return torch.tensor([value], dtype=dtype).view(torch.uint8).tolist()
+
+
+def _check_words(flat, pattern):
+    """Every byte of the dense 1-D device tensor `flat` follows the repeating byte
+    `pattern` (whose length divides 4), checked on device.
+
+    The bytes are reduced as int32 words (min and max both equal the pattern's word):
+    int32 is reduced natively, while a uint8/int8 reduction widens its input to an
+    int32 copy, 4x the tensor. The last nbytes % 4 bytes are read on the host.
+    """
+    raw = flat.view(torch.uint8)
+    nbytes = raw.numel()
+    nwords = nbytes // 4
+    word = int.from_bytes(bytes(pattern * (4 // len(pattern))), "little", signed=True)
+    words = raw[: nwords * 4].view(torch.int32)
+    rows, tail = divmod(nwords, CHECK_ROW)
     parts = []
     if rows:
-        parts.append(flat[: rows * CHECK_ROW].view(rows, CHECK_ROW))
+        parts.append(words[: rows * CHECK_ROW].view(rows, CHECK_ROW))
     if tail:
-        parts.append(flat[rows * CHECK_ROW :])
+        parts.append(words[rows * CHECK_ROW :])
     for part in parts:
         hi = part.amax().cpu().item()
         lo = part.amin().cpu().item()
-        assert hi == value and lo == value, f"min {lo} max {hi} != {value} (n={n})"
+        assert hi == word and lo == word, f"min {lo:#x} max {hi:#x} != {word:#x}"
+    rest = raw[nwords * 4 :].cpu().tolist()
+    expect = [pattern[(nwords * 4 + i) % len(pattern)] for i in range(len(rest))]
+    assert rest == expect, f"last bytes {rest} != {expect}"
+
+
+def _check_values(flat, value):
+    """Every element of the dense 1-D device tensor `flat` equals `value`."""
+    _check_words(flat, _element_bytes(value, flat.dtype))
 
 
 def _boundary_indices(n):
@@ -163,13 +185,7 @@ def test_fill_strided_large_leaves_gaps():
     for i in _boundary_indices(n):
         assert flat[2 * i : 2 * i + 2].cpu().tolist() == [8, 1], f"row {i}"
     # Every even byte (column 0) is 8 and every odd byte (column 1) still 1.
-    rows, tail = divmod(2 * n, CHECK_ROW)
-    parts = [flat[: rows * CHECK_ROW].view(rows, CHECK_ROW)] if rows else []
-    parts += [flat[rows * CHECK_ROW :]] if tail else []
-    for part in parts:
-        for col, value in ((0, 8), (1, 1)):
-            sub = part[..., col::2]
-            assert sub.amin().cpu().item() == value and sub.amax().cpu().item() == value
+    _check_words(flat, [8, 1])
 
 
 @pytest.mark.parametrize("shape", [(), (1,), (3, 4), (2, 3, 5)])

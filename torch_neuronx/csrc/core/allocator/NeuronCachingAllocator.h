@@ -76,6 +76,12 @@ nrt_tensor_t* findTensor(void* ptr);
 TensorPtr findTensorPtr(void* ptr);
 
 nrt_tensor_t* getTensorFromContext(void* ctx);
+// The NRT tensor of an allocation, for a caller outside the stream workers that
+// hands the handle out (e.g. to Python). A fresh allocation is bound by its
+// kAlloc op on the allocation stream's worker; if that op has not run yet, this
+// waits for the allocation stream to reach it (errors surface as from a stream
+// synchronize). Never call it from a stream worker. Call without the GIL.
+nrt_tensor_t* getBoundTensorFromContext(void* ctx);
 void recordStream(const c10::DataPtr& data_ptr, c10::Stream stream);
 void remove(void* ptr);
 
