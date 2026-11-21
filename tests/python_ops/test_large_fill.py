@@ -22,6 +22,8 @@ DEV = "neuron"
 # Row length of the 2-D views the checks reduce over; any value whose views have
 # dimensions well inside the runtime limit works.
 CHECK_ROW = 1 << 20
+# Rows per checked chunk (1 GiB of words), bounding the check's temporaries.
+CHECK_ROWS = 256
 
 
 def _dense_flat(x):
@@ -37,9 +39,11 @@ def _check_words(flat, pattern):
     """Every byte of the dense 1-D device tensor `flat` follows the repeating byte
     `pattern` (whose length divides 4), checked on device.
 
-    The bytes are reduced as int32 words (min and max both equal the pattern's word):
-    int32 is reduced natively, while a uint8/int8 reduction widens its input to an
-    int32 copy, 4x the tensor. The last nbytes % 4 bytes are read on the host.
+    The bytes are compared as int32 words: a uint8/int8 reduction widens its input to
+    an int32 copy, 4x the tensor. Neuron reduces int32 through float32, which is not
+    exact above 2^24, so each chunk is XORed with the expected word and its min and
+    max must be 0 (a nonzero int32 stays nonzero in float32). The last nbytes % 4
+    bytes are read on the host.
     """
     raw = flat.view(torch.uint8)
     nbytes = raw.numel()
@@ -47,15 +51,16 @@ def _check_words(flat, pattern):
     word = int.from_bytes(bytes(pattern * (4 // len(pattern))), "little", signed=True)
     words = raw[: nwords * 4].view(torch.int32)
     rows, tail = divmod(nwords, CHECK_ROW)
-    parts = []
-    if rows:
-        parts.append(words[: rows * CHECK_ROW].view(rows, CHECK_ROW))
+    chunk = CHECK_ROWS * CHECK_ROW
+    end = rows * CHECK_ROW
+    parts = [words[r : min(r + chunk, end)].view(-1, CHECK_ROW) for r in range(0, end, chunk)]
     if tail:
         parts.append(words[rows * CHECK_ROW :])
     for part in parts:
-        hi = part.amax().cpu().item()
-        lo = part.amin().cpu().item()
-        assert hi == word and lo == word, f"min {lo:#x} max {hi:#x} != {word:#x}"
+        diff = torch.bitwise_xor(part, word)
+        hi = diff.amax().cpu().item()
+        lo = diff.amin().cpu().item()
+        assert hi == 0 and lo == 0, f"words differ from {word:#x} (xor min {lo} max {hi})"
     rest = raw[nwords * 4 :].cpu().tolist()
     expect = [pattern[(nwords * 4 + i) % len(pattern)] for i in range(len(rest))]
     assert rest == expect, f"last bytes {rest} != {expect}"
