@@ -213,6 +213,9 @@ bool IsSupportedDtype(c10::ScalarType dt);
 
 /**
  * Downcast int64→int32 and float64→float32 tensors in-place.
+ * Other unsupported integer dtypes widen to int32, except uint8/int8 for the fills
+ * and filled factories (fill_, zero_, zeros, ones, full, ones_like), which are exact
+ * at their own width.
  * Called only on the casting path, after PreprocessArgs.
  * Uses NeuronSafeCast for CPU round-trip when needed.
  *

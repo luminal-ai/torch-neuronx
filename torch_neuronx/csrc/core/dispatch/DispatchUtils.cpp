@@ -200,6 +200,18 @@ static bool IsScalarTypeArg(const c10::Argument& arg) {
   return false;
 }
 
+// Ops whose result is one value written to every element: a fill or a filled
+// factory reads no element, so it is exact at any integer width. Widening a
+// uint8/int8 tensor to int32 for them would only cost a 4x int32 copy of the
+// tensor plus a 4x int32 result cast back (a 6 GiB uint8 zeros needs 48 GiB).
+static bool KeepsNarrowIntegerDtype(const c10::FunctionSchema& schema, c10::ScalarType dt) {
+  static const std::unordered_set<std::string> kFillOps = {
+      "aten::fill_", "aten::zero_", "aten::zeros", "aten::ones", "aten::full", "aten::ones_like",
+  };
+  return (dt == c10::ScalarType::Byte || dt == c10::ScalarType::Char) &&
+         kFillOps.count(schema.name()) > 0;
+}
+
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema) {
   const auto& schema_args = schema.arguments();
   // Per-op cpu_bounce (HostCC workaround): these ops route their int64
@@ -214,7 +226,7 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
     // Downcast any ScalarType kwarg with unsupported dtype
     if (IsScalarTypeArg(schema_args[i]) && arg.isInt()) {
       auto dt = static_cast<c10::ScalarType>(arg.toInt());
-      if (!IsSupportedDtype(dt)) {
+      if (!IsSupportedDtype(dt) && !KeepsNarrowIntegerDtype(schema, dt)) {
         auto target = CastTarget(dt);
         args[i] = c10::IValue(static_cast<int64_t>(target));
         TORCH_NEURONX_DISPATCH_DEBUG("[DowncastArgs] ", schema_args[i].name(), " kwarg ", dt, " → ",
@@ -231,7 +243,7 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
         continue;
       }
       auto dt = t.scalar_type();
-      if (!IsSupportedDtype(dt)) {
+      if (!IsSupportedDtype(dt) && !KeepsNarrowIntegerDtype(schema, dt)) {
         auto target = CastTarget(dt);
         args[i] = c10::IValue(NeuronSafeCast(t, target));
         TORCH_NEURONX_DISPATCH_DEBUG("[DowncastArgs] arg[", i, "] ", dt, " → ", target);

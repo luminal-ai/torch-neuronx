@@ -3,9 +3,13 @@
 #include <ATen/native/transformers/sdp_utils.h>
 #include <ATen/ops/_conj.h>
 #include <ATen/ops/_neg_view.h>
+#include <ATen/ops/full_native.h>
 #include <ATen/ops/nonzero_numpy.h>
+#include <ATen/ops/ones_like_native.h>
+#include <ATen/ops/ones_native.h>
 #include <ATen/ops/stack.h>
 #include <ATen/ops/view_as_real.h>
+#include <ATen/ops/zeros_native.h>
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
@@ -135,6 +139,14 @@ void NeuronDispatcher::RegisterOp(const std::string& op_name, py::object python_
   static const std::unordered_set<std::string> kCopyOps = {
       "copy_",
   };
+  static const std::unordered_set<std::string> kFillOps = {
+      "fill_.Scalar",
+      "fill_.Tensor",
+      "zero_",
+  };
+  static const std::unordered_set<std::string> kFilledFactoryOps = {
+      "zeros", "zeros.out", "ones", "ones.out", "full", "full.out", "ones_like", "ones_like.out",
+  };
   static const std::unordered_set<std::string> kToCopyOps = {
       "_to_copy",
   };
@@ -180,6 +192,18 @@ void NeuronDispatcher::RegisterOp(const std::string& op_name, py::object python_
     lib.impl(op_name.c_str(),
              torch::CppFunction::makeFromBoxedFunctor(
                  std::make_unique<BoxedDispatchFunctor>(reg, &NeuronDispatcher::DispatchCopyImpl)));
+  } else if (kFillOps.count(bare_name)) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::RegisterOp] registered DispatchFill handler",
+                                 " op=", op_name);
+    lib.impl(op_name.c_str(),
+             torch::CppFunction::makeFromBoxedFunctor(
+                 std::make_unique<BoxedDispatchFunctor>(reg, &NeuronDispatcher::DispatchFillImpl)));
+  } else if (kFilledFactoryOps.count(bare_name)) {
+    TORCH_NEURONX_DISPATCH_DEBUG(
+        "[NeuronDispatcher::RegisterOp] registered DispatchFilledFactory handler", " op=", op_name);
+    lib.impl(op_name.c_str(),
+             torch::CppFunction::makeFromBoxedFunctor(std::make_unique<BoxedDispatchFunctor>(
+                 reg, &NeuronDispatcher::DispatchFilledFactoryImpl)));
   } else if (kToCopyOps.count(bare_name)) {
     TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::RegisterOp] registered DispatchToCopy handler",
                                  " op=", op_name);
@@ -294,6 +318,160 @@ void NeuronDispatcher::DispatchScalarTensor(const c10::OperatorHandle& op,
       " target_device=", target_device.str(), " neuron_dtype=", neuron_tensor.scalar_type());
 
   torch::jit::push(*stack, neuron_tensor);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fills of tensors with a dimension above the NEFF limit
+// ═══════════════════════════════════════════════════════════════
+
+namespace {
+
+// The runtime keeps each NEFF tensor dimension in a uint32: NMGR extract_tensor_info
+// rejects a larger one ("Invalid shape dimension ... for tensor output0") and the
+// NEFF fails to load.
+constexpr int64_t kMaxNeffTensorDim = std::numeric_limits<uint32_t>::max();
+// Row length of the views a large fill is lowered over.
+constexpr int64_t kLargeFillRow = int64_t{1} << 30;
+
+bool HasDimAboveNeffLimit(c10::IntArrayRef sizes) {
+  return std::any_of(sizes.begin(), sizes.end(),
+                     [](int64_t s) { return s > kMaxNeffTensorDim; });
+}
+
+// Views of `t` that together cover exactly its elements, each once, with every
+// dimension at most kLargeFillRow. Fill semantics do not depend on an element's
+// position, so filling each view fills `t`.
+void AppendFillViews(const at::Tensor& t, std::vector<at::Tensor>& views) {
+  if (t.is_non_overlapping_and_dense()) {
+    // The elements of a dense tensor occupy exactly numel consecutive storage
+    // slots from its offset, whatever its dimension order.
+    const int64_t n = t.numel();
+    const auto flat = t.as_strided({n}, {1}, t.storage_offset());
+    const int64_t rows = n / kLargeFillRow;
+    const int64_t tail = n % kLargeFillRow;
+    if (rows > 0) {
+      views.push_back(flat.narrow(0, 0, rows * kLargeFillRow).view({rows, kLargeFillRow}));
+    }
+    if (tail > 0) {
+      views.push_back(flat.narrow(0, rows * kLargeFillRow, tail));
+    }
+    return;
+  }
+  for (int64_t d = 0; d < t.dim(); ++d) {
+    const int64_t size = t.size(d);
+    if (size > kLargeFillRow) {
+      for (int64_t start = 0; start < size; start += kLargeFillRow) {
+        AppendFillViews(t.narrow(d, start, std::min(kLargeFillRow, size - start)), views);
+      }
+      return;
+    }
+  }
+  views.push_back(t);
+}
+
+std::vector<int64_t> SizesFromIValue(const c10::IValue& v) {
+  if (v.isIntList()) {
+    return v.toIntVector();
+  }
+  std::vector<int64_t> sizes;
+  for (const auto& s : v.toSymIntVector()) {
+    sizes.push_back(s.guard_int(__FILE__, __LINE__));
+  }
+  return sizes;
+}
+
+}  // namespace
+
+void NeuronDispatcher::DispatchFillImpl(const c10::OperatorHandle& op,
+                                        c10::DispatchKeySet dispatch_keys,
+                                        torch::jit::Stack* stack, const OpRegistration& reg) {
+  // fill_.Scalar(Tensor(a!) self, Scalar value), fill_.Tensor(Tensor(a!) self, Tensor value),
+  // zero_(Tensor(a!) self): all return self.
+  const size_t num_args = op.schema().arguments().size();
+  const at::Tensor self = torch::jit::peek(*stack, 0, num_args).toTensor();
+  if (!HasDimAboveNeffLimit(self.sizes())) {
+    DispatchImpl(op, dispatch_keys, stack, reg);
+    return;
+  }
+
+  auto args = torch::jit::pop(*stack, num_args);
+  std::vector<at::Tensor> views;
+  AppendFillViews(self, views);
+  TORCH_NEURONX_DISPATCH_DEBUG("[DispatchFill] op=", c10::toString(op.schema().operator_name()),
+                               " sizes=", self.sizes(), " views=", views.size());
+  for (const auto& view : views) {
+    torch::jit::push(*stack, view);
+    for (size_t i = 1; i < args.size(); ++i) {
+      torch::jit::push(*stack, args[i]);
+    }
+    DispatchImpl(op, dispatch_keys, stack, reg);
+    torch::jit::drop(*stack, op.schema().returns().size());
+  }
+  torch::jit::push(*stack, self);
+}
+
+void NeuronDispatcher::DispatchFilledFactoryImpl(const c10::OperatorHandle& op,
+                                                 c10::DispatchKeySet dispatch_keys,
+                                                 torch::jit::Stack* stack,
+                                                 const OpRegistration& reg) {
+  const auto& schema = op.schema();
+  const std::string& name = schema.name();  // "aten::zeros", ...
+  const std::string& overload = schema.overload_name();
+  const size_t num_args = schema.arguments().size();
+  const bool is_like = name == "aten::ones_like";
+  // The result's sizes: `self`'s for ones_like, the size argument otherwise.
+  const c10::IValue& first = torch::jit::peek(*stack, 0, num_args);
+  const bool oversized = is_like ? HasDimAboveNeffLimit(first.toTensor().sizes())
+                                 : HasDimAboveNeffLimit(SizesFromIValue(first));
+  if (!oversized) {
+    DispatchImpl(op, dispatch_keys, stack, reg);
+    return;
+  }
+
+  auto args = torch::jit::pop(*stack, num_args);
+  TORCH_NEURONX_DISPATCH_DEBUG("[DispatchFilledFactory] op=", name, ".", overload,
+                               " -> composite empty + fill");
+  const bool is_out = !overload.empty();
+  if (is_out) {
+    // zeros.out(size, *, out), ones.out(size, *, out), full.out(size, fill_value, *, out),
+    // ones_like.out(self, *, memory_format, out): the out tensor is the last argument.
+    at::Tensor out = args.back().toTensor();
+    if (name == "aten::zeros") {
+      at::native::zeros_out(SizesFromIValue(args[0]), out);
+    } else if (name == "aten::ones") {
+      at::native::ones_out(SizesFromIValue(args[0]), out);
+    } else if (name == "aten::full") {
+      at::native::full_out(SizesFromIValue(args[0]), args[1].toScalar(), out);
+    } else {
+      TORCH_CHECK(is_like, "DispatchFilledFactory: unexpected op ", name, ".", overload);
+      at::native::ones_like_out(args[0].toTensor(),
+                                args[1].toOptional<c10::MemoryFormat>(), out);
+    }
+    torch::jit::push(*stack, out);
+    return;
+  }
+
+  // Functional overloads end with (dtype, layout, device, pin_memory[, memory_format]).
+  const size_t opt = is_like ? 1 : (name == "aten::full" ? 2 : 1);
+  const auto dtype = args[opt].toOptional<at::ScalarType>();
+  const auto layout = args[opt + 1].toOptional<at::Layout>();
+  const auto device = args[opt + 2].toOptional<at::Device>();
+  const auto pin_memory = args[opt + 3].toOptional<bool>();
+  at::Tensor result;
+  if (name == "aten::zeros") {
+    result = at::native::zeros_symint(c10::fromIntArrayRefSlow(SizesFromIValue(args[0])), dtype,
+                                      layout, device, pin_memory);
+  } else if (name == "aten::ones") {
+    result = at::native::ones(SizesFromIValue(args[0]), dtype, layout, device, pin_memory);
+  } else if (name == "aten::full") {
+    result = at::native::full(SizesFromIValue(args[0]), args[1].toScalar(), dtype, layout, device,
+                              pin_memory);
+  } else {
+    TORCH_CHECK(is_like, "DispatchFilledFactory: unexpected op ", name);
+    result = at::native::ones_like(args[0].toTensor(), dtype, layout, device, pin_memory,
+                                   args[opt + 4].toOptional<c10::MemoryFormat>());
+  }
+  torch::jit::push(*stack, result);
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -344,6 +344,34 @@ class NeuronDispatcher {
                                torch::jit::Stack* stack, const OpRegistration& reg);
 
   /**
+   * Dedicated handler for the in-place fills aten::fill_.Scalar, aten::fill_.Tensor
+   * and aten::zero_.
+   *
+   * The Neuron runtime stores every NEFF tensor dimension as a uint32, so an
+   * eager fill of a tensor with a larger dimension compiles to a NEFF the runtime
+   * refuses to load. A fill writes one value to every element, so it is lowered
+   * over views of `self` that cover exactly its elements with every dimension
+   * within the limit (a dense tensor as one [rows, 2^30] view plus its remainder;
+   * a strided one in slices of the large dimension). Every other fill takes
+   * DispatchImpl unchanged.
+   */
+  static void DispatchFillImpl(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys,
+                               torch::jit::Stack* stack, const OpRegistration& reg);
+
+  /**
+   * Dedicated handler for the filled factories aten::zeros, aten::ones, aten::full,
+   * aten::ones_like and their .out overloads.
+   *
+   * A result with a dimension above the NEFF limit cannot be one NEFF output, so
+   * these run PyTorch's own composite kernel (at::native: empty, then zero_/fill_),
+   * whose fill DispatchFillImpl lowers. Every other call takes DispatchImpl
+   * unchanged.
+   */
+  static void DispatchFilledFactoryImpl(const c10::OperatorHandle& op,
+                                        c10::DispatchKeySet dispatch_keys,
+                                        torch::jit::Stack* stack, const OpRegistration& reg);
+
+  /**
    * Dedicated handler implementation for aten::_to_copy.
    * Handles CPU↔Neuron via NRT, Neuron→Neuron dtype cast via MLIR,
    * or NRT-based CPU-bounce for unsupported dtypes (float64, bool, int32, int64).
