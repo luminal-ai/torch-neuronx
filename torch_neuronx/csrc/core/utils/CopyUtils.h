@@ -23,6 +23,14 @@ void zero_fill_neuron_bytes(void* storage_ptr, size_t byte_offset, size_t nbytes
 /// `aten::zero_` on a Neuron tensor: a dense tensor's bytes are zeroed in place
 /// (zero_fill_neuron_bytes); any other view takes a zeroed dense copy through `copy_`.
 at::Tensor& zero_neuron(at::Tensor& self);
+
+/// `dst.copy_(src)` from a contiguous host tensor into a non-contiguous Neuron view: one batched
+/// host-to-device write of dst's contiguous spans (nrt_tensor_write_batch), run as a host op in
+/// stream order (after the stream's earlier work, before its later work); the caller does not
+/// wait. Unless `non_blocking`, the write reads a copy of `src` taken now (copy_'s contract: the
+/// source may change once copy_ returns); with it, `src` is kept alive and must stay unchanged
+/// until the write ran.
+void write_cpu_to_strided_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blocking);
 // Internal submission helper. The dispatcher validates the NRT cast contract
 // and materializes a contiguous source before calling it.
 void cast_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);

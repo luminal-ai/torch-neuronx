@@ -617,6 +617,19 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
           *seq = 1;
           return NRT_SUCCESS;
         }));
+    EXPECT_CALL(*nrt, nrt_tensor_write_batch(_, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](const nrt_tensor_batch_t* batches, uint64_t n) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          for (uint64_t b = 0; b < n; ++b) {
+            for (uint32_t i = 0; i < batches[b].num_ops; ++i) {
+              const auto& op = batches[b].ops[i];
+              std::memcpy(At(batches[b].tensor, op.offset, op.size), op.buffer, op.size);
+            }
+            ++batch_writes_;
+          }
+          return NRT_SUCCESS;
+        }));
     EXPECT_CALL(*nrt, nrta_tensor_copy(_, _, _, _, _, _, _, _, _))
         .Times(AnyNumber())
         .WillRepeatedly(Invoke([this](nrt_tensor_t* src, uint64_t src_offset, nrt_tensor_t* dst,
@@ -652,6 +665,7 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
   std::map<uintptr_t, std::vector<uint8_t>> memory_;
   std::atomic<int> bind_delay_ms_{0};
   int writes_ = 0;
+  int batch_writes_ = 0;
   std::vector<uint64_t> copies_;
 };
 
@@ -744,4 +758,37 @@ TEST_F(ZeroFillTest, AFreshAllocationsHandleIsReadAfterItsBinding) {
     }
   }
   bind_delay_ms_ = 0;
+}
+
+// copy_ from the host into a non-contiguous Neuron view (write_cpu_to_strided_neuron): one batched
+// write of the view's spans, in stream order, from a snapshot of the source; bytes outside the
+// view keep their values.
+TEST_F(ZeroFillTest, AHostSourceLandsInAStridedViewAsOneBatchedWrite) {
+  constexpr int64_t kE = 6, kRows = 40, kCols = 96, kHalf = 48;
+  auto data = allocate(kE * kRows * kCols);
+  c10::Storage storage(c10::Storage::use_byte_size_t(), kE * kRows * kCols, std::move(data),
+                       NeuronCachingAllocator::get(), false);
+  at::Tensor view = at::detail::make_tensor<c10::TensorImpl>(
+      c10::Storage(storage), c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), caffe2::TypeMeta::Make<uint8_t>());
+  // Expert 2's second half of each row: [40, 48] at row stride 96 (vLLM's w3 into w13).
+  const std::vector<int64_t> sizes{kRows, kHalf}, strides{kCols, 1};
+  view.unsafeGetTensorImpl()->set_sizes_and_strides(
+      c10::IntArrayRef(sizes), c10::IntArrayRef(strides),
+      std::optional<int64_t>(2 * kRows * kCols + kHalf));
+  ASSERT_FALSE(view.is_contiguous());
+  at::Tensor src = at::randint(0, 255, {kRows, kHalf}, at::TensorOptions().dtype(at::kByte));
+  at::Tensor expected = src.clone();
+  torch_neuronx::utils::write_cpu_to_strided_neuron(src, view, /*non_blocking=*/false);
+  src.fill_(7);  // copy_'s contract: the source may change once it returns
+  syncDevice();
+  auto bytes = Read(storage.data_ptr().get(), kE * kRows * kCols);
+  for (int64_t i = 0; i < kE * kRows * kCols; ++i) {
+    const int64_t e = i / (kRows * kCols), r = (i / kCols) % kRows, c = i % kCols;
+    if (e == 2 && c >= kHalf) {
+      ASSERT_EQ(bytes[i], expected.index({r, c - kHalf}).item<uint8_t>()) << "byte " << i;
+    } else {
+      ASSERT_EQ(bytes[i], 0xAB) << "byte " << i;
+    }
+  }
+  EXPECT_EQ(batch_writes_, 1);
 }

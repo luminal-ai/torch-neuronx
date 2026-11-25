@@ -106,6 +106,14 @@ NRT_STATUS nrt_tensor_write(nrt_tensor_t* tensor, const void* buf, size_t offset
   return NRT_FAILURE;
 }
 
+NRT_STATUS nrt_tensor_write_batch(const nrt_tensor_batch_t* batches, uint64_t num_batches) {
+  if (g_mocks_initialized) {
+    return torch_neuronx::testing::MockNRT::GetInstance()->nrt_tensor_write_batch(batches,
+                                                                                  num_batches);
+  }
+  return NRT_FAILURE;
+}
+
 NRT_STATUS nrt_tensor_read(const nrt_tensor_t* tensor, void* buf, size_t offset, size_t size) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrt_tensor_read(tensor, buf, offset,

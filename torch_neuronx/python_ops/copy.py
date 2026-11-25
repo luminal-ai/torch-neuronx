@@ -190,18 +190,10 @@ class CopyNeuronImpl(OperationImplementation):
                         cpu_prepared, self_tensor, non_blocking=non_blocking
                     )
                 else:
-                    # A non-contiguous destination: the source lands in a contiguous device
-                    # tensor, then a device-side strided copy writes it into the destination's
-                    # elements (one coalesced NKI launch, or one stream-ordered copy per
-                    # contiguous span), as _to_copy re-applies a source's strides. Never a host
-                    # round trip of the destination's whole storage.
-                    from torch_neuronx.python_ops import io_tensor
-
-                    temp_neuron = io_tensor.empty(
-                        cpu_prepared.shape, dtype=cpu_prepared.dtype, device=self_tensor.device
-                    )
-                    _C._nrt_copy_cpu_to_neuron_tensor(cpu_prepared, temp_neuron, non_blocking=False)
-                    _C._nki_copy_strided_neuron_to_neuron(temp_neuron, self_tensor)
+                    # A non-contiguous destination: one batched host-to-device write of its
+                    # contiguous spans, in stream order. Never a host round trip of the
+                    # destination's whole storage.
+                    _C._write_cpu_to_strided_neuron(cpu_prepared, self_tensor, non_blocking=non_blocking)
 
                 return ExecutionResult(success=True, output=self_tensor)
             except Exception as e:

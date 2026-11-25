@@ -999,6 +999,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Never routes to the NKI kernel, so nki_strided_copy_ can fall back here without recursing.",
       py::arg("src"), py::arg("dst"));
   m.def(
+      "_write_cpu_to_strided_neuron",
+      [](const at::Tensor& src, at::Tensor& dst, bool non_blocking) {
+        torch_neuronx::utils::write_cpu_to_strided_neuron(src, dst, non_blocking);
+      },
+      py::arg("src"), py::arg("dst"), py::arg("non_blocking") = false,
+      "copy_ from a contiguous host tensor into a non-contiguous Neuron view: one batched "
+      "write of the view's spans, in stream order");
+
+  m.def(
       "_nki_copy_strided_neuron_to_neuron",
       [](const at::Tensor& src_neuron, at::Tensor& dst_neuron) {
         torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(src_neuron, dst_neuron);

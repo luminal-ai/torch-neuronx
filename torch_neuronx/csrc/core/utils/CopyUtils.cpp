@@ -453,6 +453,48 @@ void ValidateStridedCopy(const at::Tensor& src, const at::Tensor& dst) {
 
 }  // namespace
 
+void write_cpu_to_strided_neuron(const at::Tensor& src_in, at::Tensor& dst, bool non_blocking) {
+  TORCH_CHECK(src_in.device().type() == c10::DeviceType::CPU && src_in.is_contiguous(),
+              "write_cpu_to_strided_neuron: expected a contiguous host source");
+  TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
+              "write_cpu_to_strided_neuron: expected a Neuron destination");
+  TORCH_CHECK(src_in.sizes().equals(dst.sizes()) && src_in.dtype() == dst.dtype(),
+              "write_cpu_to_strided_neuron: src and dst must have the same shape and dtype");
+  if (src_in.numel() == 0) return;
+  const at::Tensor src = non_blocking ? src_in : src_in.clone();
+  auto spans = std::make_shared<std::vector<CopySpan>>();
+  EnumerateCopySpans(src, dst, *spans);
+  const int device = dst.device().index();
+  const char* src_base = static_cast<const char*>(src.storage().data());
+  void* dst_ptr = dst.storage().mutable_data();
+  at::neuron::HostKernelExecution::HostFn write = [spans, src_base, dst_ptr](
+                                                      const std::vector<at::neuron::TensorDataRef>&,
+                                                      const std::vector<at::neuron::TensorDataRef>&) {
+    // Run after the stream's earlier work: the destination is bound and nothing queued ahead
+    // of this write still writes it.
+    nrt_tensor_t* tensor = c10_neuron::NeuronCachingAllocator::findTensor(dst_ptr);
+    EXECUTION_RUNTIME_CHECK(tensor, "write_cpu_to_strided_neuron: destination not bound");
+    std::vector<nrt_tensor_batch_op_t> ops;
+    ops.reserve(spans->size());
+    for (const auto& span : *spans) {
+      ops.push_back({span.dst_offset_bytes, span.size_bytes,
+                     const_cast<char*>(src_base + span.src_offset_bytes)});
+    }
+    nrt_tensor_batch_t batch{tensor, ops.data(), static_cast<uint32_t>(ops.size())};
+    NRT_STATUS status = nrt_tensor_write_batch(&batch, 1);
+    if (status != NRT_SUCCESS) {
+      throw torch_neuronx::ExecutionRuntimeException(
+          "write_cpu_to_strided_neuron: nrt_tensor_write_batch failed", status);
+    }
+  };
+  auto kernel = std::make_unique<at::neuron::HostKernelExecution>(
+      "neuron::copy::cpu_to_strided_neuron", std::vector<at::neuron::TensorDataRef>{},
+      std::vector<at::neuron::TensorDataRef>{}, std::move(write), device,
+      std::vector<at::Tensor>{src, dst});
+  at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(device),
+                                     std::make_unique<at::neuron::OperationContext>(std::move(kernel)));
+}
+
 void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   ValidateStridedCopy(src, dst);
 
