@@ -4,6 +4,7 @@
 #include <c10/util/Logging.h>
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -470,21 +471,22 @@ void write_cpu_to_strided_neuron(const at::Tensor& src_in, at::Tensor& dst, bool
   at::neuron::HostKernelExecution::HostFn write = [spans, src_base, dst_ptr](
                                                       const std::vector<at::neuron::TensorDataRef>&,
                                                       const std::vector<at::neuron::TensorDataRef>&) {
-    // Run after the stream's earlier work: the destination is bound and nothing queued ahead
-    // of this write still writes it.
+    // Runs on the stream after its earlier work (a kHost op starts only once every prior device
+    // op of the stream has retired) and before its later work (which gates on it), so it is
+    // ordered against this stream's writers exactly as an ordinary write is. It writes the view's
+    // bytes and no others: one write per contiguous span, so a concurrent writer of other bytes
+    // of the same storage (another stream, a device-initiated put into a neighbouring window) is
+    // never overwritten. Writers of the view's own bytes on other streams synchronize with this
+    // stream as for any copy (PyTorch's stream semantics).
     nrt_tensor_t* tensor = c10_neuron::NeuronCachingAllocator::findTensor(dst_ptr);
     EXECUTION_RUNTIME_CHECK(tensor, "write_cpu_to_strided_neuron: destination not bound");
-    std::vector<nrt_tensor_batch_op_t> ops;
-    ops.reserve(spans->size());
     for (const auto& span : *spans) {
-      ops.push_back({span.dst_offset_bytes, span.size_bytes,
-                     const_cast<char*>(src_base + span.src_offset_bytes)});
-    }
-    nrt_tensor_batch_t batch{tensor, ops.data(), static_cast<uint32_t>(ops.size())};
-    NRT_STATUS status = nrt_tensor_write_batch(&batch, 1);
-    if (status != NRT_SUCCESS) {
-      throw torch_neuronx::ExecutionRuntimeException(
-          "write_cpu_to_strided_neuron: nrt_tensor_write_batch failed", status);
+      NRT_STATUS status = nrt_tensor_write(tensor, src_base + span.src_offset_bytes,
+                                           span.dst_offset_bytes, span.size_bytes);
+      if (status != NRT_SUCCESS) {
+        throw torch_neuronx::ExecutionRuntimeException(
+            "write_cpu_to_strided_neuron: nrt_tensor_write failed", status);
+      }
     }
   };
   auto kernel = std::make_unique<at::neuron::HostKernelExecution>(

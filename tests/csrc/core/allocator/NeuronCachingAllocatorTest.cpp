@@ -617,17 +617,22 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
           *seq = 1;
           return NRT_SUCCESS;
         }));
-    EXPECT_CALL(*nrt, nrt_tensor_write_batch(_, _))
+    EXPECT_CALL(*nrt, nrt_tensor_read(_, _, _, _))
         .Times(AnyNumber())
-        .WillRepeatedly(Invoke([this](const nrt_tensor_batch_t* batches, uint64_t n) {
+        .WillRepeatedly(Invoke([this](const nrt_tensor_t* tensor, void* buf, size_t offset,
+                                      size_t size) {
           std::lock_guard<std::mutex> lock(mutex_);
-          for (uint64_t b = 0; b < n; ++b) {
-            for (uint32_t i = 0; i < batches[b].num_ops; ++i) {
-              const auto& op = batches[b].ops[i];
-              std::memcpy(At(batches[b].tensor, op.offset, op.size), op.buffer, op.size);
-            }
-            ++batch_writes_;
-          }
+          std::memcpy(buf, At(tensor, offset, size), size);
+          extent_bytes_.push_back(size);
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*nrt, nrt_tensor_write(_, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](nrt_tensor_t* tensor, const void* buf, size_t offset,
+                                      size_t size) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          std::memcpy(At(tensor, offset, size), buf, size);
+          extent_bytes_.push_back(size);
           return NRT_SUCCESS;
         }));
     EXPECT_CALL(*nrt, nrta_tensor_copy(_, _, _, _, _, _, _, _, _))
@@ -665,7 +670,7 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
   std::map<uintptr_t, std::vector<uint8_t>> memory_;
   std::atomic<int> bind_delay_ms_{0};
   int writes_ = 0;
-  int batch_writes_ = 0;
+  std::vector<size_t> extent_bytes_;
   std::vector<uint64_t> copies_;
 };
 
@@ -760,10 +765,10 @@ TEST_F(ZeroFillTest, AFreshAllocationsHandleIsReadAfterItsBinding) {
   bind_delay_ms_ = 0;
 }
 
-// copy_ from the host into a non-contiguous Neuron view (write_cpu_to_strided_neuron): one batched
-// write of the view's spans, in stream order, from a snapshot of the source; bytes outside the
-// view keep their values.
-TEST_F(ZeroFillTest, AHostSourceLandsInAStridedViewAsOneBatchedWrite) {
+// copy_ from the host into a non-contiguous Neuron view (write_cpu_to_strided_neuron): in stream
+// order, from a snapshot of the source, writing exactly the view's bytes (one write per row span,
+// nothing read back); bytes outside the view keep their values.
+TEST_F(ZeroFillTest, AHostSourceLandsInAStridedViewWritingOnlyItsBytes) {
   constexpr int64_t kE = 6, kRows = 40, kCols = 96, kHalf = 48;
   auto data = allocate(kE * kRows * kCols);
   c10::Storage storage(c10::Storage::use_byte_size_t(), kE * kRows * kCols, std::move(data),
@@ -790,5 +795,7 @@ TEST_F(ZeroFillTest, AHostSourceLandsInAStridedViewAsOneBatchedWrite) {
       ASSERT_EQ(bytes[i], 0xAB) << "byte " << i;
     }
   }
-  EXPECT_EQ(batch_writes_, 1);
+  // One write per row span (48 bytes each), no read: no byte outside the view is touched, so a
+  // concurrent writer of the other halves cannot be overwritten.
+  EXPECT_EQ(extent_bytes_, std::vector<size_t>(kRows, kHalf));
 }
