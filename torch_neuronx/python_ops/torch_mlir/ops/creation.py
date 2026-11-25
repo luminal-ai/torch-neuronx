@@ -142,27 +142,6 @@ def torch_linspace(start, end, steps, dtype=None, out=None, **kwargs):
     return result
 
 
-@register_aten(["aten::zeros", "aten::zeros.out"], static_argnums=(0,), static_argnames=("dtype",))
-def torch_zeros(size, dtype=None, out=None, **kwargs):
-    # MLIR factories require a real dtype. Convert the real result to complex.
-    """Create a tensor filled with zeros.
-
-    Args:
-        size (tuple): Shape of the result.
-        dtype (torch.dtype, optional): Result dtype. Defaults to ``None``.
-        out (torch.Tensor, optional): Output tensor populated by registration. Defaults to
-            ``None``.
-        **kwargs: Additional arguments forwarded to ``torch.zeros``.
-
-    Returns:
-        torch.Tensor: Tensor of zeros; aliases ``out`` when provided.
-    """
-    component_dtype = _COMPLEX_COMPONENT_DTYPES.get(dtype)
-    if component_dtype is not None:
-        return torch.zeros(size, dtype=component_dtype, **kwargs).to(dtype)
-    return torch.zeros(size, dtype=dtype, **kwargs)
-
-
 @register_aten(["aten::ones", "aten::ones.out"], static_argnums=(0,), static_argnames=("dtype",))
 def torch_ones(size, dtype=None, out=None, **kwargs):
     """Create a tensor filled with ones.
@@ -325,24 +304,6 @@ def torch_full(size, value, out=None, dtype=None):
         value = torch.tensor(value, dtype=dtype)
 
     return torch.broadcast_to(value, size).to(dtype)
-
-
-@register_aten(["aten::zero_"])
-def torch_zero(x, out=None):
-    """Implement in-place zeroing through a zeros-like result.
-
-    Args:
-        x (torch.Tensor): Tensor targeted by the registered in-place operation.
-        out (torch.Tensor, optional): Unused compatibility parameter. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Zero-filled result; registered in-place dispatch writes it into
-            and returns ``x``.
-
-    Note:
-        Direct calls return a new ``zeros_like`` tensor without mutating ``x``.
-    """
-    return torch.zeros_like(x)
 
 
 @register_aten(

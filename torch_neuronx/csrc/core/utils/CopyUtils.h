@@ -14,6 +14,15 @@ void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size
 void nrt_copy_cpu_to_neuron(void* src_data_ptr, nrt_tensor_t* dst_data_ptr, size_t dst_offset,
                             size_t size);
 void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
+
+/// Zero `nbytes` bytes of the Neuron storage at `storage_ptr`, `byte_offset` bytes in, on the
+/// current stream of `device`: device-to-device copies from a zeroed device block, queued in
+/// stream order like any copy (the host never waits). Byte-exact: any length, any element type.
+void zero_fill_neuron_bytes(void* storage_ptr, size_t byte_offset, size_t nbytes, int device);
+
+/// `aten::zero_` on a Neuron tensor: a dense tensor's bytes are zeroed in place
+/// (zero_fill_neuron_bytes); any other view takes a zeroed dense copy through `copy_`.
+at::Tensor& zero_neuron(at::Tensor& self);
 // Internal submission helper. The dispatcher validates the NRT cast contract
 // and materializes a contiguous source before calling it.
 void cast_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);

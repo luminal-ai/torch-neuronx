@@ -8,6 +8,8 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <mutex>
+#include <map>
 #include <vector>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
@@ -211,6 +213,75 @@ void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   auto context = std::make_unique<at::neuron::OperationContext>(std::move(copy_kernel));
   auto stream = at::neuron::getCurrentNeuronStream(device);
   at::neuron::SubmitOperationContext(stream, std::move(context));
+}
+
+namespace {
+
+// The zeroed device block fills copy from: one per device and stream, so its zeroing (a write
+// queued on that stream) is ordered before every fill copy that reads it. Never freed: the block
+// outlives every stream that can read it, up to the runtime's shutdown.
+constexpr size_t kZeroBlockBytes = 8u << 20;
+
+const std::vector<char>& HostZeros() {
+  static const std::vector<char>* zeros = new std::vector<char>(kZeroBlockBytes, 0);
+  return *zeros;
+}
+
+void* ZeroBlock(int device, const at::neuron::NeuronStream& stream) {
+  static std::mutex mutex;
+  static auto* blocks = new std::map<std::pair<int, c10::StreamId>, c10::DataPtr>();
+  std::lock_guard<std::mutex> lock(mutex);
+  auto key = std::make_pair(device, stream.id());
+  auto it = blocks->find(key);
+  if (it != blocks->end()) return it->second.get();
+  c10::DataPtr block = c10_neuron::NeuronCachingAllocator::get()->allocate(kZeroBlockBytes);
+  void* ptr = block.get();
+  auto write = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+      "neuron::fill::zero_block", const_cast<char*>(HostZeros().data()),
+      at::neuron::TensorDataRef{c10_neuron::NeuronCachingAllocator::findTensorPtr(ptr), ptr},
+      /*dst_offset_bytes=*/0, kZeroBlockBytes, device);
+  at::neuron::SubmitOperationContext(
+      stream, std::make_unique<at::neuron::OperationContext>(std::move(write)));
+  blocks->emplace(key, std::move(block));
+  return ptr;
+}
+
+}  // namespace
+
+void zero_fill_neuron_bytes(void* storage_ptr, size_t byte_offset, size_t nbytes, int device) {
+  if (nbytes == 0) return;
+  auto stream = at::neuron::getCurrentNeuronStream(device);
+  void* block = ZeroBlock(device, stream);
+  auto block_ref = c10_neuron::NeuronCachingAllocator::findTensorPtr(block);
+  auto dst_ref = c10_neuron::NeuronCachingAllocator::findTensorPtr(storage_ptr);
+  for (size_t done = 0; done < nbytes; done += kZeroBlockBytes) {
+    auto copy = std::make_unique<at::neuron::CopyDirectKernelExecution>(
+        "neuron::fill::zero", at::neuron::TensorDataRef{block_ref, block},
+        at::neuron::TensorDataRef{dst_ref, storage_ptr}, /*src_offset_bytes=*/0,
+        byte_offset + done, std::min(kZeroBlockBytes, nbytes - done), device);
+    at::neuron::SubmitOperationContext(
+        stream, std::make_unique<at::neuron::OperationContext>(std::move(copy)));
+  }
+}
+
+at::Tensor& zero_neuron(at::Tensor& self) {
+  TORCH_CHECK(self.device().type() == c10::DeviceType::PrivateUse1, "zero_neuron: not a Neuron tensor");
+  if (self.numel() == 0) return self;
+  if (self.is_non_overlapping_and_dense()) {
+    // Its elements are exactly a span of its storage, in some order: zero the span's bytes.
+    int64_t lowest = 0;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+      if (self.stride(d) < 0) lowest += (self.size(d) - 1) * self.stride(d);
+    }
+    zero_fill_neuron_bytes(self.storage().mutable_data(),
+                           (self.storage_offset() + lowest) * self.element_size(), self.nbytes(),
+                           self.device().index());
+    return self;
+  }
+  at::Tensor zeros = at::empty(self.sizes(), self.options());
+  zero_neuron(zeros);
+  self.copy_(zeros);
+  return self;
 }
 
 namespace {

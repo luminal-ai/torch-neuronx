@@ -751,6 +751,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // m.impl("copy_", &torch_neuronx::copy_neuron);
   // m.impl("_to_copy", &torch_neuronx::_to_copy_neuron);
   m.impl("_copy_from_and_resize", &torch_neuronx::_copy_from_and_resize_neuron);
+  // Zeroing is a byte fill queued on the stream (device-to-device copies from a zeroed block):
+  // aten::zeros, zeros_like and new_zeros are empty + zero_ (their composite kernels).
+  m.impl("zero_", &torch_neuronx::utils::zero_neuron);
   // View operations
   m.impl("view", &torch_neuronx::view_neuron);
   m.impl("unfold", &torch_neuronx::unfold_neuron);

@@ -15,6 +15,7 @@
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
@@ -567,4 +568,112 @@ TEST_F(AddressWordsTest, WordsAreFilledOnTheWorkerForTensorsAllocatedAfterQueued
                                             static_cast<uint32_t>(in >> 32),
                                             static_cast<uint32_t>(out),
                                             static_cast<uint32_t>(out >> 32)}));
+}
+
+// ---------------------------------------------------------------------------
+// Zero fills queued on the stream (zero_fill_neuron_bytes): device-to-device copies from a
+// zeroed device block, byte-exact for any length.
+// ---------------------------------------------------------------------------
+
+// A fake device memory: every segment NRT allocates is host bytes at its VA, a slice is its
+// segment's bytes at an offset, and nrta_tensor_write / nrta_tensor_copy move bytes in it.
+class ZeroFillTest : public NeuronCachingAllocatorTest {
+ protected:
+  void SetUp() override {
+    NeuronCachingAllocatorTest::SetUp();
+    auto* nrt = MockNRT::GetInstance();
+    EXPECT_CALL(*nrt, nrt_tensor_allocate(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke(
+            [this](nrt_tensor_placement_t, int32_t, size_t size, const char*, nrt_tensor_t** out) {
+              std::lock_guard<std::mutex> lock(mutex_);
+              uintptr_t va = next_addr_;
+              next_addr_ += std::max(size, static_cast<size_t>(0x1000));
+              memory_[va] = std::vector<uint8_t>(size, 0xAB);  // never zero by itself
+              *out = reinterpret_cast<nrt_tensor_t*>(va);
+              return NRT_SUCCESS;
+            }));
+    EXPECT_CALL(*nrt, nrt_tensor_allocate_slice(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([](const nrt_tensor_t* base, size_t offset, size_t, const char*,
+                                  nrt_tensor_t** out) {
+          *out = reinterpret_cast<nrt_tensor_t*>(reinterpret_cast<uintptr_t>(base) + offset);
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*nrt, nrta_tensor_write(_, _, _, _, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](nrt_tensor_t* tensor, const void* buf, uint64_t offset,
+                                      uint64_t size, int, int, NRT_STATUS* ret, nrta_seq_t* seq) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          std::memcpy(At(tensor, offset, size), buf, size);
+          ++writes_;
+          *ret = NRT_SUCCESS;
+          *seq = 1;
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*nrt, nrta_tensor_copy(_, _, _, _, _, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](nrt_tensor_t* src, uint64_t src_offset, nrt_tensor_t* dst,
+                                      uint64_t dst_offset, uint64_t size, int, int,
+                                      NRT_STATUS* ret, nrta_seq_t* seq) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          std::memmove(At(dst, dst_offset, size), At(src, src_offset, size), size);
+          copies_.push_back(size);
+          *ret = NRT_SUCCESS;
+          *seq = 1;
+          return NRT_SUCCESS;
+        }));
+  }
+
+  // The fake bytes behind `tensor` + `offset`, checked to lie inside one segment.
+  uint8_t* At(const nrt_tensor_t* tensor, uint64_t offset, uint64_t size) {
+    uintptr_t va = reinterpret_cast<uintptr_t>(tensor) + offset;
+    auto it = memory_.upper_bound(va);
+    EXPECT_NE(it, memory_.begin());
+    --it;
+    EXPECT_LE(va + size, it->first + it->second.size()) << "access outside its segment";
+    return it->second.data() + (va - it->first);
+  }
+
+  std::vector<uint8_t> Read(void* ptr, size_t size) {
+    nrt_tensor_t* handle = NeuronCachingAllocator::findTensor(ptr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint8_t* bytes = At(handle, 0, size);
+    return std::vector<uint8_t>(bytes, bytes + size);
+  }
+
+  std::mutex mutex_;
+  std::map<uintptr_t, std::vector<uint8_t>> memory_;
+  int writes_ = 0;
+  std::vector<uint64_t> copies_;
+};
+
+TEST_F(ZeroFillTest, ZeroesExactlyTheRequestedBytesOfAnyLength) {
+  // More than two zero blocks (8 MiB) and not a multiple of 4 bytes, at an odd offset; queued
+  // right after the allocation, with nothing synchronized.
+  constexpr size_t kStorage = 24u << 20, kOffset = 5, kBytes = (17u << 20) + 3;
+  auto storage = allocate(kStorage);
+  torch_neuronx::utils::zero_fill_neuron_bytes(storage.get(), kOffset, kBytes, 0);
+  syncDevice();
+  auto bytes = Read(storage.get(), kStorage);
+  for (size_t i = 0; i < kStorage; ++i) {
+    const bool filled = i >= kOffset && i < kOffset + kBytes;
+    ASSERT_EQ(bytes[i], filled ? 0 : 0xAB) << "byte " << i;
+  }
+  // One zero block, zeroed once by a write; then one copy per block-sized chunk.
+  EXPECT_EQ(writes_, 1);
+  EXPECT_EQ(copies_, (std::vector<uint64_t>{8u << 20, 8u << 20, (1u << 20) + 3}));
+
+  // Later fills on the stream reuse the block; a zero-length fill queues nothing. (The block is
+  // the process's, so this is one test: a second fixture would not hold its fake bytes.)
+  copies_.clear();
+  auto first = allocate(4096), second = allocate(4099);
+  torch_neuronx::utils::zero_fill_neuron_bytes(first.get(), 0, 4096, 0);
+  torch_neuronx::utils::zero_fill_neuron_bytes(second.get(), 0, 4099, 0);
+  torch_neuronx::utils::zero_fill_neuron_bytes(second.get(), 0, 0, 0);
+  syncDevice();
+  EXPECT_EQ(Read(first.get(), 4096), std::vector<uint8_t>(4096, 0));
+  EXPECT_EQ(Read(second.get(), 4099), std::vector<uint8_t>(4099, 0));
+  EXPECT_EQ(writes_, 1);
+  EXPECT_EQ(copies_, (std::vector<uint64_t>{4096, 4099}));
 }
