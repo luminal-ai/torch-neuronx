@@ -3,6 +3,10 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include <map>
 #include <unordered_map>
 
@@ -595,8 +599,10 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
             }));
     EXPECT_CALL(*nrt, nrt_tensor_allocate_slice(_, _, _, _, _))
         .Times(AnyNumber())
-        .WillRepeatedly(Invoke([](const nrt_tensor_t* base, size_t offset, size_t, const char*,
-                                  nrt_tensor_t** out) {
+        .WillRepeatedly(Invoke([this](const nrt_tensor_t* base, size_t offset, size_t,
+                                      const char*, nrt_tensor_t** out) {
+          // The worker's binding of a fresh allocation, made slow on purpose.
+          std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms_.load()));
           *out = reinterpret_cast<nrt_tensor_t*>(reinterpret_cast<uintptr_t>(base) + offset);
           return NRT_SUCCESS;
         }));
@@ -644,6 +650,7 @@ class ZeroFillTest : public NeuronCachingAllocatorTest {
 
   std::mutex mutex_;
   std::map<uintptr_t, std::vector<uint8_t>> memory_;
+  std::atomic<int> bind_delay_ms_{0};
   int writes_ = 0;
   std::vector<uint64_t> copies_;
 };
@@ -676,4 +683,20 @@ TEST_F(ZeroFillTest, ZeroesExactlyTheRequestedBytesOfAnyLength) {
   EXPECT_EQ(Read(second.get(), 4099), std::vector<uint8_t>(4099, 0));
   EXPECT_EQ(writes_, 1);
   EXPECT_EQ(copies_, (std::vector<uint64_t>{4096, 4099}));
+
+  // A fresh storage zero-filled and then handed on by its NRT tensor at once (transport's slab:
+  // torch.zeros, then the handle): the fill is only queued, the binding is still on the worker,
+  // and the host reads the handle after the binding, not before.
+  bind_delay_ms_ = 200;
+  auto fresh = allocate(3u << 20);
+  torch_neuronx::utils::zero_fill_neuron_bytes(fresh.get(), 0, (3u << 20) - 1, 0);
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(fresh.get()), nullptr);  // not bound yet
+  nrt_tensor_t* handle = NeuronCachingAllocator::findBoundTensor(fresh.get());
+  ASSERT_NE(handle, nullptr);
+  EXPECT_EQ(handle, NeuronCachingAllocator::findTensor(fresh.get()));
+  bind_delay_ms_ = 0;
+  syncDevice();
+  auto fresh_bytes = Read(fresh.get(), 3u << 20);
+  EXPECT_EQ(std::count(fresh_bytes.begin(), fresh_bytes.end(), 0), (3 << 20) - 1);
+  EXPECT_EQ(fresh_bytes.back(), 0xAB);
 }

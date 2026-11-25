@@ -327,6 +327,18 @@ nrt_tensor_t* findTensor(void* ptr) {
   return info->block ? info->block->nrt_slice : nullptr;
 }
 
+nrt_tensor_t* findBoundTensor(void* ptr) {
+  auto* info = AllocatorRegistry::getInstance().find(ptr);
+  EXECUTION_RUNTIME_CHECK(info, "findBoundTensor: not a Neuron allocation");
+  if (info->alloc_event) {
+    // Completed right after the worker binds the allocation (AllocDirectKernelExecution).
+    auto& event = *info->alloc_event;
+    std::unique_lock<std::mutex> lock(event.sync_mutex);
+    event.sync_cv.wait(lock, [&event] { return event.is_completed.load(std::memory_order_acquire); });
+  }
+  return findTensor(ptr);
+}
+
 DevicePhysicalExtent findPhysicalExtent(void* ptr) {
   auto* info = AllocatorRegistry::getInstance().find(ptr);
   EXECUTION_RUNTIME_CHECK(info, "findPhysicalExtent: no allocation at this pointer");

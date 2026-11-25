@@ -949,10 +949,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1,
                     "Expected Neuron tensor, got ", tensor.device());
 
-        // Get the storage implementation
-        auto storage_impl = tensor.storage().unsafeGetStorageImpl();
-        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
-        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
+        // The storage's NRT tensor once its allocation is bound: a fresh allocation is bound
+        // asynchronously by the stream worker (lazy alloc), and work queued on it (a zero fill,
+        // a copy) does not wait for that, so the handle is read after the binding.
+        nrt_tensor_t* nrt_tensor = c10_neuron::NeuronCachingAllocator::findBoundTensor(
+            tensor.storage().mutable_data());
 
         // Check for null pointer before creating PyCapsule
         TORCH_CHECK(nrt_tensor != nullptr,

@@ -77,6 +77,12 @@ TensorPtr findTensorPtr(void* ptr);
 
 nrt_tensor_t* getTensorFromContext(void* ctx);
 
+// The NRT tensor behind the storage at `ptr`, once it is bound: a fresh allocation is bound by
+// its kAlloc on the stream worker, and this waits on the host for that binding (only that; not
+// for work queued on the stream). For host code that needs the handle itself (an NRT tensor
+// handed to another runtime client). Never called on the stream worker.
+nrt_tensor_t* findBoundTensor(void* ptr);
+
 // The device (physical) extent of the bound storage at `ptr`: the physical address of its first
 // byte and the bytes of its NRT slice. A storage is an NRT slice of its segment, and NRT reports
 // a slice's physical address as its segment's start (nrt_tensor_get_device_allocation_info), so
