@@ -699,4 +699,35 @@ TEST_F(ZeroFillTest, ZeroesExactlyTheRequestedBytesOfAnyLength) {
   auto fresh_bytes = Read(fresh.get(), 3u << 20);
   EXPECT_EQ(std::count(fresh_bytes.begin(), fresh_bytes.end(), 0), (3 << 20) - 1);
   EXPECT_EQ(fresh_bytes.back(), 0xAB);
+
+  // The same ordering, many times, at varied binding delays and sizes (new segments and cached
+  // blocks): allocation, zero fill, then the handle at once is always the bound storage's.
+  std::vector<c10::DataPtr> live;
+  for (int i = 0; i < 300; ++i) {
+    bind_delay_ms_ = i % 7 == 0 ? 3 : 0;
+    const size_t size = (i % 5 == 0) ? (size_t(1) << 20) + 4096 * (i % 13) : 512 + 61 * i;
+    auto storage = allocate(size);
+    torch_neuronx::utils::zero_fill_neuron_bytes(storage.get(), 0, size, 0);
+    nrt_tensor_t* bound = NeuronCachingAllocator::findBoundTensor(storage.get());
+    ASSERT_NE(bound, nullptr) << "iteration " << i;
+    ASSERT_EQ(bound, NeuronCachingAllocator::findTensor(storage.get())) << "iteration " << i;
+    if (i % 3 == 0) live.push_back(std::move(storage));  // the rest free and are reused
+  }
+  bind_delay_ms_ = 0;
+  syncDevice();
+}
+
+// An allocation followed at once by a need for its NRT tensor (no fill, nothing synchronized),
+// repeatedly, with the worker's binding slowed at random: the handle is always the bound one.
+TEST_F(ZeroFillTest, AFreshAllocationsHandleIsReadAfterItsBinding) {
+  std::vector<c10::DataPtr> live;
+  for (int i = 0; i < 300; ++i) {
+    bind_delay_ms_ = i % 4 == 0 ? 2 : 0;
+    auto storage = allocate(256 + 97 * i);
+    nrt_tensor_t* bound = NeuronCachingAllocator::findBoundTensor(storage.get());
+    ASSERT_NE(bound, nullptr) << "iteration " << i;
+    ASSERT_EQ(bound, NeuronCachingAllocator::findTensor(storage.get())) << "iteration " << i;
+    if (i % 2 == 0) live.push_back(std::move(storage));
+  }
+  bind_delay_ms_ = 0;
 }
