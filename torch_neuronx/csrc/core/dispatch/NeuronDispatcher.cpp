@@ -364,14 +364,9 @@ static void CopyCPUIntoNeuron(const at::Tensor& cpu_src, at::Tensor& dst, bool n
   if (dst.is_contiguous()) {
     torch_neuronx::utils::copy_cpu_to_neuron(cpu_src, dst, non_blocking);
   } else {
-    // Upload to a contiguous temp on Neuron, then use on-device stride matching.
-    // Note: non_blocking is intentionally not forwarded for the temp upload —
-    // CopyToNonContiguous depends on the data being present in the temp tensor,
-    // and the temp is transient (not visible to the caller).
-    auto temp = torch::empty(
-        cpu_src.sizes(), torch::TensorOptions().dtype(cpu_src.scalar_type()).device(dst.device()));
-    torch_neuronx::utils::copy_cpu_to_neuron(cpu_src, temp, /*non_blocking=*/false);
-    torch_neuronx::utils::CopyToNonContiguous(dst, temp);
+    // A non-contiguous destination: one batched host-to-device write of its contiguous spans,
+    // in stream order (no device staging, no synchronous upload).
+    torch_neuronx::utils::write_cpu_to_strided_neuron(cpu_src, dst, non_blocking);
   }
 }
 
