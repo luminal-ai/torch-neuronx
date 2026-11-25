@@ -585,6 +585,51 @@ bool WriteDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceI
   return true;
 }
 
+void FillAddressWords(std::vector<uint32_t>& words, const std::vector<AddressWordEntry>& entries,
+                      const std::vector<std::pair<uint64_t, uint64_t>>& extents) {
+  EXECUTION_RUNTIME_CHECK(entries.size() == extents.size(), "FillAddressWords: ", entries.size(),
+                          " entries, ", extents.size(), " extents");
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    const auto [start, extent_bytes] = extents[i];
+    EXECUTION_RUNTIME_CHECK(entry.word_offset < words.size() &&
+                                words.size() - entry.word_offset >= 2,
+                            "FillAddressWords: entry ", i, " words at ", entry.word_offset,
+                            " outside ", words.size(), " words");
+    EXECUTION_RUNTIME_CHECK(entry.byte_offset <= extent_bytes &&
+                                entry.bytes <= extent_bytes - entry.byte_offset,
+                            "FillAddressWords: entry ", i, " bytes [", entry.byte_offset, ", +",
+                            entry.bytes, ") outside its storage of ", extent_bytes, " bytes");
+    const uint64_t address = start + entry.byte_offset;
+    EXECUTION_RUNTIME_CHECK(address >= start, "FillAddressWords: entry ", i, " address overflows");
+    words[entry.word_offset] = static_cast<uint32_t>(address);
+    words[entry.word_offset + 1] = static_cast<uint32_t>(address >> 32);
+  }
+}
+
+AddressWordsWriteKernelExecution::AddressWordsWriteKernelExecution(
+    const std::string& op_name, std::vector<uint32_t> words, TensorDataRef dst_ref,
+    size_t dst_offset_bytes, std::vector<AddressWordEntry> entries, int device_id)
+    : AddressWordsHostBuffer(std::move(words)),
+      WriteDirectKernelExecution(op_name, host_words_.data(), std::move(dst_ref),
+                                 dst_offset_bytes, host_words_.size() * sizeof(uint32_t),
+                                 device_id),
+      entries_(std::move(entries)) {}
+
+bool AddressWordsWriteKernelExecution::Schedule(NRT_STATUS* nrt_status,
+                                                nrt::SequenceId* sequence_id,
+                                                c10::StreamId stream_id) const {
+  std::vector<std::pair<uint64_t, uint64_t>> extents;
+  extents.reserve(entries_.size());
+  for (const auto& entry : entries_) {
+    const auto extent = c10_neuron::NeuronCachingAllocator::findPhysicalExtent(entry.ref.ptr);
+    extents.emplace_back(extent.address, extent.bytes);
+  }
+  // The host words are read by the write scheduled below; this op owns them until it completes.
+  FillAddressWords(host_words_, entries_, extents);
+  return WriteDirectKernelExecution::Schedule(nrt_status, sequence_id, stream_id);
+}
+
 ReadDirectKernelExecution::ReadDirectKernelExecution(const std::string& op_name,
                                                      TensorDataRef src_ref, void* dst_ptr,
                                                      size_t src_offset_bytes, size_t src_size_bytes,

@@ -327,6 +327,52 @@ nrt_tensor_t* findTensor(void* ptr) {
   return info->block ? info->block->nrt_slice : nullptr;
 }
 
+DevicePhysicalExtent findPhysicalExtent(void* ptr) {
+  auto* info = AllocatorRegistry::getInstance().find(ptr);
+  EXECUTION_RUNTIME_CHECK(info, "findPhysicalExtent: no allocation at this pointer");
+  EXECUTION_RUNTIME_CHECK(!info->is_scalar,
+                          "findPhysicalExtent: a scalar-cache slot has no segment-pool block");
+  Block* block = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(info->recorded_streams_mutex);
+    block = info->block;
+  }
+  EXECUTION_RUNTIME_CHECK(block && block->nrt_slice,
+                          "findPhysicalExtent: storage not bound (its kAlloc has not run)");
+  Block* root = block->root;
+  EXECUTION_RUNTIME_CHECK(root && root->nrt_tensor, "findPhysicalExtent: block has no segment");
+  nrt_tensor_t* slice = block->nrt_slice;
+  nrt_tensor_t* segment = root->nrt_tensor.get();
+
+  nrt_tensor_device_allocation_info_t slice_info{};
+  nrt_tensor_device_allocation_info_t segment_info{};
+  EXECUTION_RUNTIME_CHECK(nrt_tensor_get_device_allocation_info(slice, &slice_info) == NRT_SUCCESS,
+                          "findPhysicalExtent: nrt_tensor_get_device_allocation_info failed");
+  EXECUTION_RUNTIME_CHECK(
+      nrt_tensor_get_device_allocation_info(segment, &segment_info) == NRT_SUCCESS,
+      "findPhysicalExtent: nrt_tensor_get_device_allocation_info failed for the segment");
+  EXECUTION_RUNTIME_CHECK(slice_info.physical_address != 0 && slice_info.hbm_index >= 0,
+                          "findPhysicalExtent: invalid NRT allocation info");
+  EXECUTION_RUNTIME_CHECK(slice_info.physical_address == segment_info.physical_address &&
+                              slice_info.size == segment_info.size,
+                          "findPhysicalExtent: the slice's allocation is not its segment's");
+
+  const uint64_t slice_va = reinterpret_cast<uint64_t>(nrt_tensor_get_va(slice));
+  const uint64_t segment_va = reinterpret_cast<uint64_t>(nrt_tensor_get_va(segment));
+  const uint64_t bytes = nrt_tensor_get_size(slice);
+  EXECUTION_RUNTIME_CHECK(slice_va != 0 && segment_va != 0 && slice_va >= segment_va,
+                          "findPhysicalExtent: NRT reports no VA inside the segment for the slice");
+  const uint64_t offset = slice_va - segment_va;
+  EXECUTION_RUNTIME_CHECK(offset == block->offset,
+                          "findPhysicalExtent: slice VA offset ", offset,
+                          " differs from its block offset ", block->offset);
+  EXECUTION_RUNTIME_CHECK(bytes > 0 && offset <= segment_info.size &&
+                              bytes <= segment_info.size - offset,
+                          "findPhysicalExtent: slice [", offset, ", +", bytes,
+                          ") outside its segment of ", segment_info.size, " bytes");
+  return DevicePhysicalExtent{slice_info.physical_address + offset, bytes};
+}
+
 TensorPtr findTensorPtr(void* ptr) {
   nrt_tensor_t* slice = findTensor(ptr);
   if (!slice) return nullptr;

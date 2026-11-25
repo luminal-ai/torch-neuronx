@@ -89,6 +89,15 @@ void* nrt_tensor_get_va(const nrt_tensor_t* tensor) {
   return nullptr;
 }
 
+NRT_STATUS nrt_tensor_get_device_allocation_info(const nrt_tensor_t* tensor,
+                                                 nrt_tensor_device_allocation_info_t* info) {
+  if (g_mocks_initialized) {
+    return torch_neuronx::testing::MockNRT::GetInstance()->nrt_tensor_get_device_allocation_info(
+        tensor, info);
+  }
+  return NRT_FAILURE;
+}
+
 NRT_STATUS nrt_tensor_write(nrt_tensor_t* tensor, const void* buf, size_t offset, size_t size) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrt_tensor_write(tensor, buf, offset,

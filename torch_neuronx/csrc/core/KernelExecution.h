@@ -823,6 +823,47 @@ class WriteDirectKernelExecution
   BounceBuffer bounce_buffer_;
 };
 
+// One address word pair of an AddressWordsWriteKernelExecution: the tensor whose device address
+// fills it, and where in the words. `ref` resolves on the stream worker, where the tensor's storage
+// is bound; the address is that storage's physical address plus `byte_offset`.
+struct AddressWordEntry {
+  TensorDataRef ref;
+  size_t word_offset;    // the address's low word; the high word follows it
+  uint64_t byte_offset;  // the tensor's first byte in its storage
+  uint64_t bytes;        // the tensor's bytes
+};
+
+// Owns an AddressWordsWriteKernelExecution's host words. A base of it, constructed before the
+// write it feeds, so the write's source pointer is the words' own storage.
+struct AddressWordsHostBuffer {
+  explicit AddressWordsHostBuffer(std::vector<uint32_t> words) : host_words_(std::move(words)) {}
+  mutable std::vector<uint32_t> host_words_;
+};
+
+// Fill `words` from resolved extents: for entry i, (address, bytes) of its storage. The address is
+// written as two little-endian 32-bit words (low, high) at the entry's word offset. Throws when an
+// entry's tensor does not lie inside its storage's extent or its words fall outside `words`.
+void FillAddressWords(std::vector<uint32_t>& words, const std::vector<AddressWordEntry>& entries,
+                      const std::vector<std::pair<uint64_t, uint64_t>>& extents);
+
+// A host-to-device write of a program's words whose address words are filled on the stream
+// worker, in queue order: right before the write is scheduled, every entry's tensor is bound (its
+// kAlloc ran ahead of this op), so its physical address is known without the host ever waiting on
+// the stream. Every other word is the caller's template.
+class AddressWordsWriteKernelExecution : private AddressWordsHostBuffer,
+                                         public WriteDirectKernelExecution {
+ public:
+  AddressWordsWriteKernelExecution(const std::string& op_name, std::vector<uint32_t> words,
+                                   TensorDataRef dst_ref, size_t dst_offset_bytes,
+                                   std::vector<AddressWordEntry> entries, int device_id);
+
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
+
+ private:
+  std::vector<AddressWordEntry> entries_;
+};
+
 class ReadDirectKernelExecution
     : public NeuronKernelExecutionTyped<KernelTypeEnum::kRead, c10::DeviceType::PrivateUse1,
                                         c10::DeviceType::CPU> {

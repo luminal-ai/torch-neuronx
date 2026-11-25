@@ -33,6 +33,8 @@ class MockNRT {
   MOCK_METHOD(size_t, nrt_tensor_get_size, (const nrt_tensor_t*));
   MOCK_METHOD(void, nrt_tensor_free, (nrt_tensor_t**));
   MOCK_METHOD(void*, nrt_tensor_get_va, (const nrt_tensor_t*));
+  MOCK_METHOD(NRT_STATUS, nrt_tensor_get_device_allocation_info,
+              (const nrt_tensor_t*, nrt_tensor_device_allocation_info_t*));
   MOCK_METHOD(NRT_STATUS, nrt_tensor_write, (nrt_tensor_t*, const void*, size_t, size_t));
   MOCK_METHOD(NRT_STATUS, nrt_tensor_read, (const nrt_tensor_t*, void*, size_t, size_t));
   MOCK_METHOD(NRT_STATUS, nrt_tensor_copy,

@@ -76,6 +76,19 @@ nrt_tensor_t* findTensor(void* ptr);
 TensorPtr findTensorPtr(void* ptr);
 
 nrt_tensor_t* getTensorFromContext(void* ctx);
+
+// The device (physical) extent of the bound storage at `ptr`: the physical address of its first
+// byte and the bytes of its NRT slice. A storage is an NRT slice of its segment, and NRT reports
+// a slice's physical address as its segment's start (nrt_tensor_get_device_allocation_info), so
+// the slice's own address is that start plus the slice's offset in the segment: its VA minus the
+// segment's VA. Throws unless the storage is bound to a segment-pool block whose slice lies in
+// its segment's allocation at the block's offset. Called on the stream worker, where every
+// storage of an earlier submission is bound (queue order).
+struct DevicePhysicalExtent {
+  uint64_t address;
+  uint64_t bytes;
+};
+DevicePhysicalExtent findPhysicalExtent(void* ptr);
 void recordStream(const c10::DataPtr& data_ptr, c10::Stream stream);
 void remove(void* ptr);
 

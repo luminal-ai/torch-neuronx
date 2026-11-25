@@ -2,9 +2,16 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <cstring>
+#include <map>
+#include <unordered_map>
+
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockNeuronDevice.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
+#include "torch_neuronx/csrc/core/KernelExecution.h"
+#include "torch_neuronx/csrc/core/OperationContext.h"
+#include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
@@ -405,4 +412,159 @@ TEST_F(NeuronCachingAllocatorTest, OversizedScalarReturnsNullopt) {
   auto t =
       NeuronCachingAllocator::createCachedScalarTensor(buf, sizeof(buf), c10::ScalarType::Float, 0);
   EXPECT_FALSE(t.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Device addresses filled on the stream worker (findPhysicalExtent,
+// AddressWordsWriteKernelExecution).
+// ---------------------------------------------------------------------------
+
+// A fake NRT in which every handle is its VA, a segment's physical address is its VA plus
+// kPhysicalShift, and a slice reports its segment's physical start and size (as NRT does).
+class AddressWordsTest : public NeuronCachingAllocatorTest {
+ protected:
+  static constexpr uint64_t kPhysicalShift = 0x40'0000'0000ULL;
+
+  void SetUp() override {
+    NeuronCachingAllocatorTest::SetUp();
+    auto* nrt = MockNRT::GetInstance();
+    EXPECT_CALL(*nrt, nrt_tensor_allocate(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke(
+            [this](nrt_tensor_placement_t, int32_t, size_t size, const char*, nrt_tensor_t** out) {
+              uintptr_t va = next_addr_;
+              next_addr_ += std::max(size, static_cast<size_t>(0x1000));
+              std::lock_guard<std::mutex> lock(mutex_);
+              segments_[va] = size;
+              sizes_[va] = size;
+              *out = reinterpret_cast<nrt_tensor_t*>(va);
+              return NRT_SUCCESS;
+            }));
+    EXPECT_CALL(*nrt, nrt_tensor_allocate_slice(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](const nrt_tensor_t* base, size_t offset, size_t size,
+                                      const char*, nrt_tensor_t** out) {
+          uintptr_t va = reinterpret_cast<uintptr_t>(base) + offset;
+          std::lock_guard<std::mutex> lock(mutex_);
+          sizes_[va] = size;
+          *out = reinterpret_cast<nrt_tensor_t*>(va);
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*nrt, nrt_tensor_get_size(_))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](const nrt_tensor_t* t) -> size_t {
+          std::lock_guard<std::mutex> lock(mutex_);
+          auto it = sizes_.find(reinterpret_cast<uintptr_t>(t));
+          return it == sizes_.end() ? 0 : it->second;
+        }));
+    EXPECT_CALL(*nrt, nrt_tensor_get_device_allocation_info(_, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](const nrt_tensor_t* t,
+                                      nrt_tensor_device_allocation_info_t* info) -> NRT_STATUS {
+          uintptr_t va = reinterpret_cast<uintptr_t>(t);
+          std::lock_guard<std::mutex> lock(mutex_);
+          auto it = segments_.upper_bound(va);
+          if (it == segments_.begin()) return NRT_FAILURE;
+          --it;
+          if (va >= it->first + it->second) return NRT_FAILURE;
+          info->physical_address = it->first + kPhysicalShift;
+          info->size = it->second;
+          info->hbm_index = 0;
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*nrt, nrta_tensor_write(_, _, _, _, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([this](nrt_tensor_t* tensor, const void* buf, uint64_t offset,
+                                      uint64_t size, int, int, NRT_STATUS* ret, nrta_seq_t* seq) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          writes_.push_back({tensor, offset,
+                             std::vector<uint8_t>(static_cast<const uint8_t*>(buf),
+                                                  static_cast<const uint8_t*>(buf) + size)});
+          *ret = NRT_SUCCESS;
+          *seq = 1;
+          return NRT_SUCCESS;
+        }));
+  }
+
+  // The physical address the device reads for the storage at `ptr`, `byte_offset` bytes in:
+  // its segment's physical start plus its offset in the segment.
+  uint64_t ExpectedAddress(void* ptr, uint64_t byte_offset) {
+    uintptr_t va = reinterpret_cast<uintptr_t>(NeuronCachingAllocator::findTensor(ptr));
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = --segments_.upper_bound(va);
+    return it->first + kPhysicalShift + (va - it->first) + byte_offset;
+  }
+
+  struct Write {
+    nrt_tensor_t* tensor;
+    uint64_t offset;
+    std::vector<uint8_t> bytes;
+  };
+  std::mutex mutex_;
+  std::map<uintptr_t, size_t> segments_;
+  std::unordered_map<uintptr_t, size_t> sizes_;
+  std::vector<Write> writes_;
+};
+
+TEST_F(AddressWordsTest, PhysicalExtentIsTheSegmentStartPlusTheSliceOffset) {
+  auto first = allocate(4096);
+  auto second = allocate(8192);
+  syncDevice();
+  for (void* ptr : {first.get(), second.get()}) {
+    auto extent = NeuronCachingAllocator::findPhysicalExtent(ptr);
+    EXPECT_EQ(extent.address, ExpectedAddress(ptr, 0));
+    EXPECT_GE(extent.bytes, ptr == first.get() ? 4096u : 8192u);
+  }
+  // Two live storages never share an address.
+  EXPECT_NE(NeuronCachingAllocator::findPhysicalExtent(first.get()).address,
+            NeuronCachingAllocator::findPhysicalExtent(second.get()).address);
+}
+
+TEST_F(AddressWordsTest, PhysicalExtentRefusesAnUnknownPointer) {
+  EXPECT_THROW(NeuronCachingAllocator::findPhysicalExtent(reinterpret_cast<void*>(0xDEADBEEF)),
+               std::exception);
+}
+
+TEST_F(AddressWordsTest, FillAddressWordsWritesLowThenHighAndRefusesOutsideTheStorage) {
+  std::vector<uint32_t> words(8, 7);
+  std::vector<at::neuron::AddressWordEntry> entries{
+      {at::neuron::TensorDataRef{}, 2, 0x10, 0x20}, {at::neuron::TensorDataRef{}, 5, 0, 0x100}};
+  at::neuron::FillAddressWords(words, entries, {{0x12'3456'7000ULL, 0x40}, {0x8000ULL, 0x100}});
+  EXPECT_EQ(words, (std::vector<uint32_t>{7, 7, 0x3456'7010u, 0x12u, 7, 0x8000u, 0u, 7}));
+
+  // A view past its storage, or words past the buffer, are refused.
+  std::vector<at::neuron::AddressWordEntry> past{{at::neuron::TensorDataRef{}, 0, 0x30, 0x20}};
+  EXPECT_THROW(at::neuron::FillAddressWords(words, past, {{0x1000, 0x40}}), std::exception);
+  std::vector<at::neuron::AddressWordEntry> outside{{at::neuron::TensorDataRef{}, 7, 0, 4}};
+  EXPECT_THROW(at::neuron::FillAddressWords(words, outside, {{0x1000, 0x40}}), std::exception);
+}
+
+TEST_F(AddressWordsTest, WordsAreFilledOnTheWorkerForTensorsAllocatedAfterQueuedWork) {
+  // Nothing is synchronized between the allocations and the submission: the stream binds each
+  // allocation when its worker reaches it, and the write's addresses resolve only then.
+  auto words_dst = allocate(6 * sizeof(uint32_t));
+  auto input = allocate(4096);
+  auto output = allocate(2048);
+  std::vector<uint32_t> words{1, 2, 0, 0, 0, 0};
+  std::vector<at::neuron::AddressWordEntry> entries{
+      {at::neuron::TensorDataRef{nullptr, input.get()}, 2, 0x40, 0x100},
+      {at::neuron::TensorDataRef{nullptr, output.get()}, 4, 0, 2048}};
+  auto kernel = std::make_unique<at::neuron::AddressWordsWriteKernelExecution>(
+      "luminal::address_words", words, at::neuron::TensorDataRef{nullptr, words_dst.get()}, 0,
+      std::move(entries), 0);
+  at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(0),
+                                     std::make_unique<at::neuron::OperationContext>(
+                                         std::move(kernel)));
+  syncDevice();
+
+  ASSERT_EQ(writes_.size(), 1u);
+  EXPECT_EQ(writes_[0].tensor, NeuronCachingAllocator::findTensor(words_dst.get()));
+  ASSERT_EQ(writes_[0].bytes.size(), 6 * sizeof(uint32_t));
+  std::vector<uint32_t> written(6);
+  std::memcpy(written.data(), writes_[0].bytes.data(), writes_[0].bytes.size());
+  uint64_t in = ExpectedAddress(input.get(), 0x40), out = ExpectedAddress(output.get(), 0);
+  EXPECT_EQ(written, (std::vector<uint32_t>{1, 2, static_cast<uint32_t>(in),
+                                            static_cast<uint32_t>(in >> 32),
+                                            static_cast<uint32_t>(out),
+                                            static_cast<uint32_t>(out >> 32)}));
 }

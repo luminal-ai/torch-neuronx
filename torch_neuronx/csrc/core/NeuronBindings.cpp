@@ -12,6 +12,7 @@
 #include <torch/library.h>
 
 #include <climits>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -2112,6 +2113,71 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("graph_name"), py::arg("cache_key"), py::arg("inputs"), py::arg("outputs"),
       py::arg("has_collectives"), py::arg("input_names") = std::vector<std::string>{},
       py::arg("output_names") = std::vector<std::string>{});
+
+  // A program's words, written to `dst` in stream order with each entry's tensor's device address
+  // filled in on the stream worker (AddressWordsWriteKernelExecution): the host never resolves an
+  // address, so it never waits for the stream to bind a fresh allocation.
+  m.def(
+      "_write_address_words",
+      [](const torch::Tensor& dst, py::bytes words, const std::vector<torch::Tensor>& tensors,
+         const std::vector<int64_t>& word_offsets) {
+        TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
+                    "_write_address_words: dst must be a Neuron tensor, got ", dst.device());
+        TORCH_CHECK(dst.is_contiguous(), "_write_address_words: dst must be contiguous");
+        std::string_view bytes = words.cast<std::string_view>();
+        TORCH_CHECK(bytes.size() % sizeof(uint32_t) == 0,
+                    "_write_address_words: words are ", bytes.size(), " bytes, not whole words");
+        TORCH_CHECK(static_cast<size_t>(dst.nbytes()) == bytes.size(),
+                    "_write_address_words: dst holds ", dst.nbytes(), " bytes; words are ",
+                    bytes.size());
+        TORCH_CHECK(!bytes.empty(), "_write_address_words: no words");
+        TORCH_CHECK(tensors.size() == word_offsets.size(), "_write_address_words: ",
+                    tensors.size(), " tensors, ", word_offsets.size(), " word offsets");
+        const size_t count = bytes.size() / sizeof(uint32_t);
+        std::vector<uint32_t> host_words(count);
+        std::memcpy(host_words.data(), bytes.data(), bytes.size());
+
+        // Each entry owns two words; no two entries share one.
+        std::vector<bool> taken(count, false);
+        for (size_t i = 0; i < tensors.size(); ++i) {
+          const auto& tensor = tensors[i];
+          TORCH_CHECK(tensor.device() == dst.device(), "_write_address_words: tensor ", i,
+                      " is on ", tensor.device(), ", the words on ", dst.device());
+          TORCH_CHECK(tensor.is_contiguous(), "_write_address_words: tensor ", i,
+                      " is not contiguous");
+          TORCH_CHECK(tensor.nbytes() > 0, "_write_address_words: tensor ", i, " is empty");
+          const int64_t offset = word_offsets[i];
+          TORCH_CHECK(offset >= 0 && static_cast<size_t>(offset) + 2 <= count,
+                      "_write_address_words: entry ", i, " words at ", offset, " outside ", count,
+                      " words");
+          TORCH_CHECK(!taken[offset] && !taken[offset + 1], "_write_address_words: entry ", i,
+                      " shares a word with another entry");
+          taken[offset] = taken[offset + 1] = true;
+        }
+
+        auto [refs, contexts] = torch_neuronx::PrepareKernelTensors(tensors);
+        std::vector<at::neuron::AddressWordEntry> entries;
+        entries.reserve(tensors.size());
+        for (size_t i = 0; i < tensors.size(); ++i) {
+          entries.push_back(at::neuron::AddressWordEntry{
+              std::move(refs[i]), static_cast<size_t>(word_offsets[i]),
+              static_cast<uint64_t>(contexts[i].storage_offset * contexts[i].element_size),
+              static_cast<uint64_t>(contexts[i].size_bytes)});
+        }
+        auto [dst_refs, dst_contexts] = torch_neuronx::PrepareKernelTensors({dst});
+        const size_t dst_offset = dst_contexts[0].storage_offset * dst_contexts[0].element_size;
+        int device_id = dst.device().index();
+        auto kernel = std::make_unique<at::neuron::AddressWordsWriteKernelExecution>(
+            "luminal::address_words", std::move(host_words), std::move(dst_refs[0]), dst_offset,
+            std::move(entries), device_id);
+        auto context = std::make_unique<at::neuron::OperationContext>(std::move(kernel));
+        at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(device_id),
+                                           std::move(context));
+      },
+      "Write a program's words to dst in stream order, each tensors[i]'s device address (low "
+      "word, high word) filled in at word_offsets[i] by the stream worker once the tensor is "
+      "bound. The host never waits for the stream.",
+      py::arg("dst"), py::arg("words"), py::arg("tensors"), py::arg("word_offsets"));
 
   // Dynamic multi-tier AllGather tiling plan — test/parity utility exposing
   // the C++ ComputePlan so a Python test can assert it matches
