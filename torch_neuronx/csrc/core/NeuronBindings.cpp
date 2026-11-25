@@ -1731,6 +1731,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "_get_memory_stats",
       [memoryStatToDict](int device_index) -> py::dict {
+        // Statistics account every allocation the caller has already made (lazily bound).
+        c10_neuron::NeuronCachingAllocator::waitForPendingBindings(device_index);
         auto stats =
             at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetMemoryStats(device_index);
 
@@ -1862,6 +1864,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "_neuron_memory_snapshot",
       []() -> py::dict {
+        // A snapshot holds every allocation the caller has already made (lazily bound).
+        c10_neuron::NeuronCachingAllocator::waitForPendingBindings(-1);
         auto snapshot_info = c10_neuron::NeuronMemorySnapshot::snapshot();
 
         // Convert StackContext frames to Python list

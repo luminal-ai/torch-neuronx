@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -133,6 +134,48 @@ struct AllocatorRegistry {
 };
 
 using AllocationInfo = AllocatorRegistry::AllocationInfo;
+
+// The kAlloc completion events of allocations already returned to callers, per device, until
+// they complete (in queue order, so the front completes first).
+struct PendingBindings {
+  std::mutex mutex;
+  std::unordered_map<int, std::deque<std::shared_ptr<at::neuron::EventImpl>>> events;
+
+  static PendingBindings& getInstance() {
+    static auto* instance = new PendingBindings();
+    return *instance;
+  }
+
+  void add(int device, std::shared_ptr<at::neuron::EventImpl> event) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& queue = events[device];
+    while (!queue.empty() && queue.front()->is_completed.load(std::memory_order_acquire)) {
+      queue.pop_front();
+    }
+    queue.push_back(std::move(event));
+  }
+
+  // The device's pending events; completed ones are dropped. device < 0: every device's.
+  std::vector<std::shared_ptr<at::neuron::EventImpl>> pending(int device) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<std::shared_ptr<at::neuron::EventImpl>> out;
+    for (auto& [dev, queue] : events) {
+      if (device >= 0 && dev != device) continue;
+      while (!queue.empty() && queue.front()->is_completed.load(std::memory_order_acquire)) {
+        queue.pop_front();
+      }
+      for (auto& event : queue) {
+        if (!event->is_completed.load(std::memory_order_acquire)) out.push_back(event);
+      }
+    }
+    return out;
+  }
+};
+
+void WaitForCompletion(at::neuron::EventImpl& event) {
+  std::unique_lock<std::mutex> lock(event.sync_mutex);
+  event.sync_cv.wait(lock, [&event] { return event.is_completed.load(std::memory_order_acquire); });
+}
 
 // Compile-time materializer hook for PyTorch 2.13+ (StorageImpl::set_materializer).
 #if __has_include(<c10/core/StorageMaterializer.h>)
@@ -251,6 +294,7 @@ class NeuronAllocator : public c10::Allocator {
     auto alloc_kernel = std::make_unique<at::neuron::AllocDirectKernelExecution>(
         "neuron::alloc::lazy", at::neuron::TensorDataRef{nullptr, ptr}, size, device);
     alloc_info->alloc_event = alloc_kernel->GetEventImpl();
+    PendingBindings::getInstance().add(device, alloc_info->alloc_event);
     auto context = std::make_unique<at::neuron::OperationContext>(std::move(alloc_kernel));
     at::neuron::SubmitOperationContext(stream, std::move(context));
 
@@ -330,13 +374,13 @@ nrt_tensor_t* findTensor(void* ptr) {
 nrt_tensor_t* findBoundTensor(void* ptr) {
   auto* info = AllocatorRegistry::getInstance().find(ptr);
   EXECUTION_RUNTIME_CHECK(info, "findBoundTensor: not a Neuron allocation");
-  if (info->alloc_event) {
-    // Completed right after the worker binds the allocation (AllocDirectKernelExecution).
-    auto& event = *info->alloc_event;
-    std::unique_lock<std::mutex> lock(event.sync_mutex);
-    event.sync_cv.wait(lock, [&event] { return event.is_completed.load(std::memory_order_acquire); });
-  }
+  // Completed right after the worker binds the allocation (AllocDirectKernelExecution).
+  if (info->alloc_event) WaitForCompletion(*info->alloc_event);
   return findTensor(ptr);
+}
+
+void waitForPendingBindings(int device) {
+  for (auto& event : PendingBindings::getInstance().pending(device)) WaitForCompletion(*event);
 }
 
 DevicePhysicalExtent findPhysicalExtent(void* ptr) {

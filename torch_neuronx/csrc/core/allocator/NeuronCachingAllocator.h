@@ -83,6 +83,11 @@ nrt_tensor_t* getTensorFromContext(void* ctx);
 // handed to another runtime client). Never called on the stream worker.
 nrt_tensor_t* findBoundTensor(void* ptr);
 
+// Waits on the host until every allocation already returned on `device` (every device for
+// device < 0) is bound: its segment exists and its NRT tensor is set. Memory statistics and
+// snapshots take this first, so they account every allocation their caller made before them.
+void waitForPendingBindings(int device);
+
 // The device (physical) extent of the bound storage at `ptr`: the physical address of its first
 // byte and the bytes of its NRT slice. A storage is an NRT slice of its segment, and NRT reports
 // a slice's physical address as its segment's start (nrt_tensor_get_device_allocation_info), so

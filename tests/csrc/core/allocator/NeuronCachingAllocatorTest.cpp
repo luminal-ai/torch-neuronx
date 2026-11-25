@@ -729,5 +729,19 @@ TEST_F(ZeroFillTest, AFreshAllocationsHandleIsReadAfterItsBinding) {
     ASSERT_EQ(bound, NeuronCachingAllocator::findTensor(storage.get())) << "iteration " << i;
     if (i % 2 == 0) live.push_back(std::move(storage));
   }
+  // Memory statistics and snapshots wait for every allocation already returned: right after
+  // allocations (one a new segment), waitForPendingBindings leaves each bound.
+  for (int i = 0; i < 100; ++i) {
+    bind_delay_ms_ = i % 5 == 0 ? 2 : 0;
+    auto a = allocate(300 + 7 * i);
+    auto b = allocate(i % 10 == 0 ? (size_t(2) << 20) + 4096 * i : 1000 + i);
+    NeuronCachingAllocator::waitForPendingBindings(i % 2 == 0 ? 0 : -1);
+    ASSERT_NE(NeuronCachingAllocator::findTensor(a.get()), nullptr) << "iteration " << i;
+    ASSERT_NE(NeuronCachingAllocator::findTensor(b.get()), nullptr) << "iteration " << i;
+    if (i % 3 == 0) {
+      live.push_back(std::move(a));
+      live.push_back(std::move(b));
+    }
+  }
   bind_delay_ms_ = 0;
 }
